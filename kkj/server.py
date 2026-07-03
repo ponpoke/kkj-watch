@@ -394,6 +394,7 @@ class Handler(BaseHTTPRequestHandler):
 
         ev_html = "".join(
             f"<li>[{H.escape(ev['event_type'])}] {H.escape(ev['detected_at'][:19])}</li>" for ev in events)
+        # </script>によるタグ脱出を防止(<\/ にエスケープ)
         jsonld = json.dumps({
             "@context": "https://schema.org", "@type": "Dataset",
             "name": rec.get("project_name"),
@@ -401,8 +402,11 @@ class Handler(BaseHTTPRequestHandler):
             "url": f"{base}/case/{urllib.parse.quote(key, safe='')}",
             "creator": {"@type": "Organization", "name": "kkj-watch"},
             "isBasedOn": rec.get("document_uri"),
-        }, ensure_ascii=False)
+        }, ensure_ascii=False).replace("</", "<\\/")
 
+        doc_uri = rec.get("document_uri") or ""
+        if not doc_uri.lower().startswith(("http://", "https://")):
+            doc_uri = ""  # javascript:等の危険スキームは描画しない
         page = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{name} | 入札案件の変更監視 - kkj-watch</title>

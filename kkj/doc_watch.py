@@ -34,8 +34,21 @@ def allowed_by_robots(url: str) -> bool:
         return True
 
 
+def _assert_public_host(url: str):
+    """SSRF対策: 解決先がプライベート/リンクローカル/ループバックなら拒否"""
+    import ipaddress
+    import socket
+    host = urllib.parse.urlsplit(url).hostname or ""
+    for info in socket.getaddrinfo(host, None):
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError(f"non-public address: {ip}")
+
+
 def fetch_hash(url: str):
     """SHA-256と、可能ならPDF抽出テキスト(内部版管理用)を返す"""
+    _assert_public_host(url)
     req = urllib.request.Request(url, headers={"User-Agent": config.USER_AGENT})
     h = hashlib.sha256()
     size = 0
