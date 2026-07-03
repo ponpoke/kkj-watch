@@ -30,7 +30,9 @@ footer{margin-top:3rem;color:#888;font-size:.85rem}
 <h1>kkj-watch</h1>
 <p><span class="badge">Watch</span><span class="badge">Extract</span><span class="badge">Diff</span></p>
 <p><strong>入札の事故は公告の見落としではなく「公告後の変化」の見落としで起きる。</strong><br>
-kkj-watchは官公需案件の訂正公告・締切変更・様式差替えを検知し、応募要件を構造化JSONで返すAPI/MCPサーバーです。</p>
+官公需情報ポータルには、いま<strong>訂正公告だけで約3,000件</strong>が掲載されています(2026年7月・当社調べ)。締切前倒しに気づかなければ失権、旧様式で提出すれば無効 — kkj-watchはこの「公告後の変化」を自動検知します。</p>
+<h2>見張り代行(月5,000円)— 一番人気</h2>
+<p>キーワードまたは発注機関(5つまで)をお知らせいただくだけ。変化があった日に<strong>before/after付き</strong>でメール報告+週次サマリー。設定はすべてこちらで行います。<strong>初月無償・請求書払い・いつでも解約可。</strong>下の申込ボタンからどうぞ。</p>
 <h2>できること</h2>
 <table>
 <tr><th>変更検知</th><td>案件と原典文書を巡回し、変化をイベント配信。全スナップショットにSHA-256証跡</td></tr>
