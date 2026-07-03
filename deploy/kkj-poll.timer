@@ -1,0 +1,9 @@
+[Unit]
+Description=Run kkj-watch polling every 3 hours
+
+[Timer]
+OnCalendar=00/3:10
+Persistent=true
+
+[Install]
+WantedBy=timers.target

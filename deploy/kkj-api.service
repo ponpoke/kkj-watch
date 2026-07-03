@@ -1,0 +1,15 @@
+[Unit]
+Description=kkj-watch JSON API + remote MCP endpoint
+After=network.target
+
+[Service]
+Type=simple
+User=kkj
+WorkingDirectory=/opt/kkj-watch
+EnvironmentFile=/etc/kkj-watch.env
+ExecStart=/usr/bin/python3 -m kkj.server 8787
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+# Smithery 掲載設定(https://smithery.ai/docs)
+# リポジトリをGitHubに公開後、SmitheryにこのリポジトリURLを登録する
+startCommand:
+  type: stdio
+  configSchema: {}
+  commandFunction: |-
+    () => ({ command: "python", args: ["-m", "kkj.mcp_server"] })

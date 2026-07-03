@@ -1,0 +1,5 @@
+# kkj-watch リバースプロキシ(自動HTTPS)。<your-domain> を取得ドメインに置換
+# インストール: https://caddyserver.com/docs/install → /etc/caddy/Caddyfile に配置
+<your-domain> {
+    reverse_proxy 127.0.0.1:8787
+}

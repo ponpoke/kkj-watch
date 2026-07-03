@@ -1,0 +1,13 @@
+# データ・ログ(資産と運用情報は公開しない)
+data/
+*.log
+
+# 事業戦略・営業文書(非公開)
+plan
+docs/sales_onepager.md
+docs/phase0_design.md
+docs/launch_announcement.md
+docs/zenn_article.md
+
+__pycache__/
+*.pyc

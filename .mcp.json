@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "kkj-watch": {
+      "command": "python",
+      "args": ["-m", "kkj.mcp_server"],
+      "cwd": "C:\\Users\\ponzu\\Desktop\\fable_pj"
+    }
+  }
+}

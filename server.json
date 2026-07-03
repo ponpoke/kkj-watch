@@ -1,0 +1,12 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.ponpoke/kkj-watch",
+  "description": "日本の官公需(入札)案件の変更検知・要件構造化。訂正公告・締切変更・様式差替えの検知と、応募資格/統一資格等級/提出書類/締切のJSON抽出。",
+  "version": "0.1.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://YOUR-DOMAIN/mcp"
+    }
+  ]
+}
