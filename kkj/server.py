@@ -194,6 +194,15 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _client_ip(self):
+        """リバースプロキシ(Caddy)経由の場合はX-Forwarded-Forから実IPを得る"""
+        ip = self.client_address[0]
+        if ip in ("127.0.0.1", "::1"):
+            xff = self.headers.get("X-Forwarded-For", "")
+            if xff:
+                return xff.split(",")[0].strip()
+        return ip
+
     def _identify(self, conn):
         """APIキー検証+無償ティアの日次上限。戻り値: (client識別子, エラー or None)"""
         from . import billing
@@ -203,7 +212,7 @@ class Handler(BaseHTTPRequestHandler):
             if rec is None:
                 return None, (401, {"error": "invalid_api_key"})
             return f"key:{rec['name']}", None
-        ip = self.client_address[0]
+        ip = self._client_ip()
         if ip not in ("127.0.0.1", "::1") and billing.over_free_limit(conn, ip):
             return None, (429, {"error": "free_tier_daily_limit",
                                 "hint": "X-API-Key ヘッダで有償キーを指定してください"})
