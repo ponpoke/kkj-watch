@@ -235,6 +235,17 @@ class Handler(BaseHTTPRequestHandler):
                 ])
             elif path.startswith("/paid/requirements/"):
                 self._paid_requirements(conn, path)
+            elif path == "/robots.txt":
+                base = self._base_url()
+                body = (f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n"
+                        f"# AI agents: {base}/llms.txt and {base}/.well-known/x402.json\n").encode()
+                self._raw(body, "text/plain; charset=utf-8")
+            elif path in ("/.well-known/x402", "/.well-known/x402.json"):
+                self._well_known_x402(conn)
+            elif path == "/sitemap.xml":
+                self._sitemap(conn)
+            elif path.startswith("/case/"):
+                self._case_page(conn, path)
             elif path == "/llms.txt":
                 body = LLMS_TXT.encode("utf-8")
                 self.send_response(200)
@@ -255,6 +266,128 @@ class Handler(BaseHTTPRequestHandler):
                                           "/events?limit=N", "POST /mcp"]}, 404)
         finally:
             conn.close()
+
+    def _base_url(self):
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host", "")
+        proto = self.headers.get("X-Forwarded-Proto", "https")
+        return f"{proto}://{host}"
+
+    def _raw(self, body, ctype, status=200):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _well_known_x402(self, conn):
+        """x402 V2 Discovery: 販売リソースの機械可読マニフェスト"""
+        from . import x402_gate, extractor
+        base = self._base_url()
+        resources = []
+        if x402_gate.available():
+            reqs = x402_gate.payment_requirements(
+                f"{base}/paid/requirements/latest",
+                "Structured bidding requirements for the newest Japanese government tender "
+                "(qualifications, rank A-D, documents, deadlines) as JSON. "
+                f"Replace 'latest' with any case key from {base}/cases (free).",
+                output_schema={"input": {"type": "http", "method": "GET"},
+                               "output": extractor.EXTRACT_SCHEMA},
+            )
+            resources.append({
+                "resource": f"{base}/paid/requirements/latest",
+                "type": "http", "method": "GET",
+                "x402Version": 1,
+                "accepts": [reqs],
+                "lastUpdated": store.now_utc(),
+            })
+        self._json({
+            "x402Version": 1,
+            "name": "kkj-watch",
+            "description": "Japanese government tender (kkj.go.jp) change-detection and "
+                           "structured bidding requirements. Machine-payable via x402.",
+            "docs": f"{base}/llms.txt",
+            "mcp": f"{base}/mcp",
+            "resources": resources,
+        })
+
+    def _sitemap(self, conn):
+        base = self._base_url()
+        rows = conn.execute("SELECT key, last_seen FROM cases ORDER BY first_seen DESC LIMIT 5000").fetchall()
+        parts = ['<?xml version="1.0" encoding="UTF-8"?>',
+                 '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+                 f"<url><loc>{base}/</loc></url>"]
+        for r in rows:
+            k = urllib.parse.quote(r["key"], safe="")
+            parts.append(f"<url><loc>{base}/case/{k}</loc><lastmod>{r['last_seen'][:10]}</lastmod></url>")
+        parts.append("</urlset>")
+        self._raw("\n".join(parts).encode("utf-8"), "application/xml; charset=utf-8")
+
+    def _case_page(self, conn, path):
+        """案件別HTMLページ(検索エンジン・AIクローラ向けの長尾コンテンツ)"""
+        import html as H
+        key = urllib.parse.unquote(path[len("/case/"):])
+        row = conn.execute("SELECT * FROM cases WHERE key=?", (key,)).fetchone()
+        if row is None:
+            self._json({"error": "not_found"}, 404)
+            return
+        rec = json.loads(row["latest_json"])
+        name = H.escape(rec.get("project_name") or "案件")
+        org = H.escape(rec.get("organization_name") or "")
+        base = self._base_url()
+        ext = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (key,)).fetchone()
+        events = conn.execute(
+            "SELECT event_type, detected_at, detail_json FROM events WHERE case_key=? ORDER BY id", (key,)
+        ).fetchall()
+
+        req_html = ""
+        if ext:
+            e = json.loads(ext["result_json"])
+            rows_html = ""
+            if e.get("unified_qualification_rank"):
+                rows_html += f"<tr><th>統一資格 等級</th><td>{H.escape(e['unified_qualification_rank'])}</td></tr>"
+            if e.get("bid_method"):
+                rows_html += f"<tr><th>入札方式</th><td>{H.escape(e['bid_method'])}</td></tr>"
+            if e.get("performance_period"):
+                rows_html += f"<tr><th>履行期間</th><td>{H.escape(e['performance_period'])}</td></tr>"
+            for d in e.get("deadlines", [])[:6]:
+                rows_html += f"<tr><th>{H.escape(d['label'])}</th><td>{H.escape(d['value'])}</td></tr>"
+            quals = "".join(f"<li>{H.escape(q)}</li>" for q in e.get("qualifications", [])[:10])
+            docs = "".join(f"<li>{H.escape(d)}</li>" for d in e.get("required_documents", [])[:15])
+            req_html = (f"<h2>応募要件(構造化)</h2><table>{rows_html}</table>"
+                        f"<h3>参加資格</h3><ul>{quals}</ul><h3>提出書類</h3><ul>{docs}</ul>")
+
+        ev_html = "".join(
+            f"<li>[{H.escape(ev['event_type'])}] {H.escape(ev['detected_at'][:19])}</li>" for ev in events)
+        jsonld = json.dumps({
+            "@context": "https://schema.org", "@type": "Dataset",
+            "name": rec.get("project_name"),
+            "description": f"{org}の入札案件。変更検知・応募要件の構造化データ(kkj-watch)。",
+            "url": f"{base}/case/{urllib.parse.quote(key, safe='')}",
+            "creator": {"@type": "Organization", "name": "kkj-watch"},
+            "isBasedOn": rec.get("document_uri"),
+        }, ensure_ascii=False)
+
+        page = f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{name} | 入札案件の変更監視 - kkj-watch</title>
+<meta name="description" content="{org}「{name}」の変更履歴(訂正・締切変更・様式差替え)と応募要件の構造化データ。">
+<script type="application/ld+json">{jsonld}</script>
+<style>body{{font-family:system-ui,'Hiragino Sans',sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;line-height:1.8;color:#222}}
+h1{{font-size:1.3rem}}table{{border-collapse:collapse}}td,th{{border:1px solid #ddd;padding:.3rem .6rem;font-size:.92rem;text-align:left}}
+a{{color:#0a6}}</style></head><body>
+<p><a href="/">← kkj-watch</a></p>
+<h1>{name}</h1>
+<p>発注機関: {org} / 公告日: {H.escape((rec.get('cft_issue_date') or '')[:10])} /
+<a href="{H.escape(rec.get('document_uri') or '#')}" rel="nofollow">原典公告</a></p>
+{req_html}
+<h2>変更監視ログ</h2><ul>{ev_html}</ul>
+<p>この案件は3時間おきに監視されています。訂正公告・締切変更・様式差替えの検知は
+<a href="/">kkj-watch</a>(API/MCP/x402対応)で。</p>
+</body></html>"""
+        self._raw(page.encode("utf-8"), "text/html; charset=utf-8")
 
     def _paid_requirements(self, conn, path):
         """x402有料エンドポイント: 応募要件の構造化JSONを$X402_PRICE_USD/コールで販売
