@@ -7,7 +7,7 @@ Type=simple
 User=kkj
 WorkingDirectory=/opt/kkj-watch
 EnvironmentFile=/etc/kkj-watch.env
-ExecStart=/usr/bin/python3 -m kkj.server 8787
+ExecStart=/opt/kkj-watch/venv/bin/python -m kkj.server 8787
 Restart=on-failure
 RestartSec=5
 

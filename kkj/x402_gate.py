@@ -92,12 +92,41 @@ def _facilitator_post(endpoint: str, payload: dict) -> dict:
         return json.loads(resp.read())
 
 
+def _sdk_verify_settle(payment_dict: dict, req_dict: dict):
+    """x402 SDK + CDP認証ファシリテータ(base / base-sepolia両対応)"""
+    import x402
+    from x402.http import HTTPFacilitatorClientSync
+    from cdp.x402 import create_facilitator_config
+    cfg = create_facilitator_config(
+        os.environ["CDP_API_KEY_ID"], os.environ["CDP_API_KEY_SECRET"])
+    fc = HTTPFacilitatorClientSync(cfg)
+    payload = x402.parse_payment_payload(payment_dict)
+    reqs = x402.PaymentRequirementsV1.model_validate(req_dict)
+    v = fc.verify(payload, reqs)
+    if not getattr(v, "is_valid", False):
+        return False, f"verify failed: {getattr(v, 'invalid_reason', v)}"
+    s = fc.settle(payload, reqs)
+    if not getattr(s, "success", False):
+        return False, f"settle failed: {getattr(s, 'error_reason', s)}"
+    return True, base64.b64encode(
+        s.model_dump_json(by_alias=True).encode()).decode()
+
+
 def verify_and_settle(x_payment_b64: str, requirements: dict):
     """X-PAYMENTヘッダを検証・決済。戻り値: (成功bool, X-PAYMENT-RESPONSE用b64 or エラーメッセージ)"""
     try:
         payment = json.loads(base64.b64decode(x_payment_b64))
     except Exception:
         return False, "invalid X-PAYMENT encoding"
+    # 第1候補: x402 SDK + CDPファシリテータ(要 venv実行 + CDPキー)
+    if os.environ.get("CDP_API_KEY_ID"):
+        try:
+            return _sdk_verify_settle(payment, requirements)
+        except ImportError:
+            pass  # SDK無し → レガシー経路へ
+        except Exception as e:
+            return False, f"facilitator error: {e}"
+    # 第2候補: 素のHTTP(x402.orgテストネットファシリテータ等)
     envelope = {
         "x402Version": 1,
         "paymentPayload": payment,
