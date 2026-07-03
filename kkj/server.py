@@ -15,6 +15,33 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import store
 
 
+LLMS_TXT = """# kkj-watch
+
+> 日本の官公需(政府・自治体入札)案件の「公告後の変化」— 訂正公告・締切変更・様式差替え — を検知し、応募要件を構造化JSONで返すAPI/MCPサービス。データ源は官公需情報ポータルサイト(中小企業庁)公式検索API。原文の再配布はせず、抽出した事実・差分メタデータ・原典URLのみを提供する。
+
+## API (無料ティア: 200リクエスト/日、X-API-Keyで拡張)
+
+- GET /cases?limit=N : 監視中の入札案件一覧(JSON)
+- GET /cases/{key} : 案件詳細+スナップショット履歴(SHA-256証跡)+変更イベント+抽出済み応募要件
+- GET /events?limit=N : 変更イベント(FIELD_CHANGED/DOC_CHANGED)フィード。フィールド単位のbefore/after付き
+- GET /stats : 蓄積状況
+
+## MCP (Streamable HTTP)
+
+- エンドポイント: POST /mcp
+- ツール: search_cases(キーワード検索) / get_case(詳細) / list_change_events(変更フィード) / get_requirements(応募資格・全省庁統一資格等級・提出書類・締切の構造化JSON)
+
+## ユースケース
+
+- 「クラウド関連で参加資格が等級Bの案件を探し、先週から要件が変わったものを教えて」を1ターンで
+- 入札担当エージェントの締切変更見張り、訂正公告の即時検知
+
+## 連絡先・有償プラン
+
+- 従量: 構造化¥30/案件+API¥1/リクエスト。月額ウォッチ¥5,000〜
+- ponzuzuzuzuzu@gmail.com
+"""
+
 LANDING_HTML = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>kkj-watch — 入札公告の「その後」を見逃さない</title>
@@ -182,6 +209,13 @@ class Handler(BaseHTTPRequestHandler):
                      "detail": json.loads(r["detail_json"]) if r["detail_json"] else None}
                     for r in rows
                 ])
+            elif path == "/llms.txt":
+                body = LLMS_TXT.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "" or path == "/":
                 body = LANDING_HTML.encode("utf-8")
                 self.send_response(200)
