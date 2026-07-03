@@ -119,6 +119,28 @@ CREATE INDEX IF NOT EXISTS idx_usage_client ON usage_log(client);
 """
 
 
+PAYMENT_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS payment_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    client TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    error TEXT
+);
+"""
+
+
+def log_payment_attempt(conn, client, resource, success, error):
+    """X-PAYMENT付きリクエスト(=支払い試行)を成否・失敗理由込みで記録"""
+    conn.executescript(PAYMENT_LOG_SCHEMA)
+    conn.execute(
+        "INSERT INTO payment_log(at, client, resource, success, error) VALUES (?,?,?,?,?)",
+        (store.now_utc(), client, resource, 1 if success else 0, error),
+    )
+    conn.commit()
+
+
 def log_usage(conn, client, user_agent, path):
     conn.executescript(USAGE_SCHEMA)
     conn.execute(
@@ -188,6 +210,11 @@ class Handler(BaseHTTPRequestHandler):
                 for t in ("cases", "snapshots", "events", "extractions"):
                     out[t] = conn.execute(f"SELECT COUNT(*) n FROM {t}").fetchone()["n"]
                 out["usage"] = usage_stats(conn)
+                conn.executescript(PAYMENT_LOG_SCHEMA)
+                out["payments"] = {
+                    "attempts": conn.execute("SELECT COUNT(*) n FROM payment_log").fetchone()["n"],
+                    "settled": conn.execute("SELECT COUNT(*) n FROM payment_log WHERE success=1").fetchone()["n"],
+                }
                 self._json(out)
             elif path == "/cases":
                 rows = conn.execute(
@@ -434,6 +461,8 @@ a{{color:#0a6}}</style></head><body>
             self._json(x402_gate.body_402(reqs), 402)
             return
         ok, result = x402_gate.verify_and_settle(x_payment, reqs)
+        log_payment_attempt(conn, self._client_ip(), resource, ok,
+                            None if ok else result[:300])
         if not ok:
             self._json(x402_gate.body_402(reqs, error=result), 402)
             return
