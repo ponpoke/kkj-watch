@@ -1,12 +1,12 @@
 # kkj-watch — 入札案件の変更検知・要件構造化エンジン
 
-**🌐 公開サービス: http://5.75.142.199/ (無料ティア 200リクエスト/日)**
+**🌐 公開サービス: https://5.75.142.199.sslip.io/ (無料ティア 200リクエスト/日)**
 
 ```json
 // Claude / Cursor などのMCPクライアント設定
 {
   "mcpServers": {
-    "kkj-watch": { "url": "http://5.75.142.199/mcp" }
+    "kkj-watch": { "url": "https://5.75.142.199.sslip.io/mcp" }
   }
 }
 ```

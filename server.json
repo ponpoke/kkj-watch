@@ -6,7 +6,7 @@
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://YOUR-DOMAIN/mcp"
+      "url": "https://5.75.142.199.sslip.io/mcp"
     }
   ]
 }
