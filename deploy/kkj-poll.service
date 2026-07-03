@@ -1,14 +1,11 @@
 [Unit]
-Description=kkj-watch polling (cases + source documents + extraction)
+Description=kkj-watch slow lane (source documents + extraction + backup)
 
 [Service]
 Type=oneshot
 User=kkj
 WorkingDirectory=/opt/kkj-watch
 EnvironmentFile=/etc/kkj-watch.env
-ExecStart=/usr/bin/python3 -m kkj.pipeline poll
 ExecStart=/usr/bin/python3 -m kkj.pipeline poll-docs
 ExecStart=/usr/bin/python3 -m kkj.pipeline extract 300
-ExecStart=/usr/bin/python3 -m kkj.pipeline link 30
-ExecStart=/usr/bin/python3 -m kkj.pipeline analyze 20
 ExecStart=/usr/bin/python3 -m kkj.pipeline backup

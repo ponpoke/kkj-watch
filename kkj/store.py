@@ -62,7 +62,8 @@ def canonical_hash(record: dict) -> str:
 
 def connect():
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(config.DB_PATH)
+    # timeout: 高速レーン(毎時巡回)と低速レーン(文書・抽出)の並走時のロック待ち
+    conn = sqlite3.connect(config.DB_PATH, timeout=60)
     conn.executescript(SCHEMA)
     conn.row_factory = sqlite3.Row
     return conn
