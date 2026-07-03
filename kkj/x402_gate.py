@@ -21,6 +21,11 @@ USDC = {
     "base": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "base-sepolia": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
 }
+# EIP-712ドメイン(オンチェーンのDOMAIN_SEPARATORと照合済み)
+USDC_EIP712 = {
+    "base": {"name": "USD Coin", "version": "2"},
+    "base-sepolia": {"name": "USDC", "version": "2"},
+}
 FACILITATOR = {
     "base": "https://api.cdp.coinbase.com/platform/v2/x402",
     "base-sepolia": "https://x402.org/facilitator",
@@ -51,7 +56,7 @@ def payment_requirements(resource_url: str, description: str, output_schema=None
         "payTo": cfg["pay_to"],
         "maxTimeoutSeconds": 120,
         "asset": USDC[cfg["network"]],
-        "extra": {"name": "USDC", "version": "2"},
+        "extra": USDC_EIP712[cfg["network"]],
     }
     if output_schema:
         req["outputSchema"] = output_schema
