@@ -94,7 +94,14 @@ def link_corrections(limit=30, analyze=True):
                     orec.get("project_name", ""),
                     orec.get("project_description") or orec.get("project_name", ""),
                     rec.get("project_description") or title,
-                    "訂正・変更公告(元公告との比較)")
+                    "訂正・変更公告(元公告との比較)",
+                    provenance={
+                        "source_kind": "訂正・変更公告",
+                        "source_url": rec.get("document_uri"),
+                        "original_key": orig["key"],
+                        "original_url": orec.get("document_uri"),
+                        "correction_key": r["key"],
+                    })
                 ev_id = conn.execute(
                     "SELECT id FROM events WHERE case_key=? AND event_type='CORRECTION_NOTICE' ORDER BY id DESC LIMIT 1",
                     (orig["key"],)).fetchone()[0]

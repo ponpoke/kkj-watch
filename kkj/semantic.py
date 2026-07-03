@@ -32,8 +32,10 @@ ANALYSIS_SCHEMA = {
                     "impact": {"type": "string", "description": "入札参加者への影響の一行説明(日本語)"},
                     "confidence": {"type": "string", "enum": ["high", "medium", "low"],
                                    "description": "原文から直接確認できる=high、推測を含む=medium/low"},
+                    "source_quote": {"type": ["string", "null"],
+                                     "description": "この変更の根拠となる原文の一節をそのまま引用(要約禁止)。原文に該当箇所がなければnull"},
                 },
-                "required": ["event_type", "before", "after", "impact", "confidence"],
+                "required": ["event_type", "before", "after", "impact", "confidence", "source_quote"],
                 "additionalProperties": False,
             },
         },
@@ -79,14 +81,55 @@ def _llm(prompt: str) -> dict:
     return json.loads(next(b["text"] for b in data["content"] if b["type"] == "text"))
 
 
-def analyze_pair(title: str, before_text: str, after_text: str, source: str) -> dict:
-    """新旧テキストの意味差分(訂正公告・文書差替え・本文変更 共通)"""
-    return _llm(
+import re
+
+# 機械的confidence基準: 明示的な値(日時・金額・数量・資格)が原文引用に含まれるか
+_EXPLICIT = re.compile(
+    r"\d{1,2}[月/]\d{1,2}日?|\d{1,2}[:時]\d{2}|令和\d|平成\d|\d{4}年"
+    r"|[0-9,]+円|[0-9.]+[%％]|\d+[かヶケカ][月年]|\d+日間"
+    r"|ISO ?\d+|ISMS|Pマーク|プライバシーマーク|[ABCD]等級|等級|統一資格")
+
+
+def harden_confidence(analysis: dict) -> dict:
+    """LLM自己評価に機械的基準を重ねる:
+    - source_quoteなし → 最大medium(根拠文で裏取りできない)
+    - 引用+before/afterに明示的な値なし → 最大medium(意味推定のみ)
+    """
+    for ch in analysis.get("changes", []):
+        quote = ch.get("source_quote") or ""
+        blob = " ".join(str(ch.get(k) or "") for k in ("before", "after")) + " " + quote
+        explicit = bool(_EXPLICIT.search(blob))
+        if not quote:
+            ch["confidence_basis"] = "no_source_quote"
+            if ch.get("confidence") == "high":
+                ch["confidence"] = "medium"
+        elif explicit:
+            ch["confidence_basis"] = "explicit_values_in_quote"
+        else:
+            ch["confidence_basis"] = "semantic_only"
+            if ch.get("confidence") == "high":
+                ch["confidence"] = "medium"
+    return analysis
+
+
+def analyze_pair(title: str, before_text: str, after_text: str, source: str,
+                 provenance: dict | None = None) -> dict:
+    """新旧テキストの意味差分(訂正公告・文書差替え・本文変更 共通)
+
+    provenance: {"source_kind","source_url","original_key","correction_key"} 等を
+    そのまま結果に添付(LLM出力ではなくシステムが保証するメタデータ)
+    """
+    analysis = _llm(
         "以下は日本の官公需(入札)案件の変更前後の内容です。入札参加者にとって意味のある変更を"
-        "分類して抽出してください。原文にない情報は捏造せず、確認できないものはconfidenceを下げてください。\n"
+        "分類して抽出してください。原文にない情報は捏造せず、確認できないものはconfidenceを下げてください。"
+        "source_quoteには根拠となる原文の一節をそのまま引用してください(言い換え禁止)。\n"
         f"案件名: {title}\n情報源: {source}\n\n"
         f"=== 変更前 ===\n{before_text[:10000]}\n\n=== 変更後 ===\n{after_text[:10000]}"
     )
+    analysis = harden_confidence(analysis)
+    if provenance:
+        analysis["source"] = provenance
+    return analysis
 
 
 def save(conn, case_key, event_id, kind, analysis):
@@ -122,7 +165,11 @@ def analyze_pending_field_events(limit=20):
         after_rec, before_rec = json.loads(snaps[0]["raw_json"]), json.loads(snaps[1]["raw_json"])
         fmt = lambda d: "\n".join(f"{k}: {v}" for k, v in sorted(d.items()))
         try:
-            analysis = analyze_pair(r["title"] or "", fmt(before_rec), fmt(after_rec), "官公需ポータル公告レコード")
+            analysis = analyze_pair(
+                r["title"] or "", fmt(before_rec), fmt(after_rec), "官公需ポータル公告レコード",
+                provenance={"source_kind": "公告レコード(ポータル)",
+                            "source_url": after_rec.get("document_uri"),
+                            "original_key": r["case_key"]})
             save(conn, r["case_key"], r["id"], "field_diff", analysis)
             conn.commit()
             done += 1

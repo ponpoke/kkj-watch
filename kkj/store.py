@@ -65,6 +65,10 @@ def connect():
     # timeout: 高速レーン(毎時巡回)と低速レーン(文書・抽出)の並走時のロック待ち
     conn = sqlite3.connect(config.DB_PATH, timeout=60)
     conn.executescript(SCHEMA)
+    try:  # 移行: 原典文書の抽出テキスト版管理(内部保存・再配布はしない)
+        conn.execute("ALTER TABLE documents ADD COLUMN text")
+    except sqlite3.OperationalError:
+        pass
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -125,15 +129,15 @@ def field_diff(old: dict, new: dict) -> dict:
     return changes
 
 
-def record_document(conn, case_key, url, sha256, size, status):
+def record_document(conn, case_key, url, sha256, size, status, text=None):
     ts = now_utc()
     prev = conn.execute(
         "SELECT sha256 FROM documents WHERE case_key=? AND url=? AND status='ok' ORDER BY id DESC LIMIT 1",
         (case_key, url),
     ).fetchone()
     conn.execute(
-        "INSERT INTO documents(case_key, url, fetched_at, sha256, size, status) VALUES (?,?,?,?,?,?)",
-        (case_key, url, ts, sha256, size, status),
+        "INSERT INTO documents(case_key, url, fetched_at, sha256, size, status, text) VALUES (?,?,?,?,?,?,?)",
+        (case_key, url, ts, sha256, size, status, text),
     )
     if status == "ok" and prev is not None and prev["sha256"] != sha256:
         conn.execute(
