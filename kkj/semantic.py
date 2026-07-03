@@ -96,6 +96,9 @@ def harden_confidence(analysis: dict) -> dict:
     - 引用+before/afterに明示的な値なし → 最大medium(意味推定のみ)
     """
     for ch in analysis.get("changes", []):
+        # 引用は根拠確認に足る最小限へ(著作権・再配布面の配慮で400字上限)
+        if ch.get("source_quote") and len(ch["source_quote"]) > 400:
+            ch["source_quote"] = ch["source_quote"][:400] + "…"
         quote = ch.get("source_quote") or ""
         blob = " ".join(str(ch.get(k) or "") for k in ("before", "after")) + " " + quote
         explicit = bool(_EXPLICIT.search(blob))

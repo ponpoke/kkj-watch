@@ -196,7 +196,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
-        limit = min(int(qs.get("limit", ["50"])[0]), 500)
+        try:
+            limit = min(int(qs.get("limit", ["50"])[0]), 500)
+        except ValueError:
+            limit = 50
         path = parsed.path.rstrip("/")
         conn = store.connect()
         try:

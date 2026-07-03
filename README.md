@@ -67,5 +67,10 @@ GET https://5.75.142.199.sslip.io/paid/requirements/{key}
 
 ## 構成
 
-Python 3.10+ 標準ライブラリのみ(依存ゼロ)。データは `data/kkj.db`(SQLite)。
-LLM抽出のみ Anthropic API(claude-haiku-4-5, structured outputs)を使用。
+Python 3.10+。コア(巡回・差分・API・MCP)は標準ライブラリのみで動作。データは `data/kkj.db`(SQLite)。
+任意依存: `pypdf`(原典PDFの本文抽出 — 未導入の場合はハッシュによる差替え検知のみに自動縮退)、
+x402決済に `PyJWT`/`cryptography`/`cdp-sdk`。
+LLM(意味づけ・要件抽出)は Anthropic API(claude-haiku-4-5, structured outputs)。
+
+制約の明記: PDF本文抽出はテキスト埋め込み型PDFが対象です。スキャン(画像)PDFは本文抽出できないため、
+その場合の差替え検知はハッシュ比較(変わった事実の検知)までとなります。
