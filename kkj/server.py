@@ -19,6 +19,8 @@ LLMS_TXT = """# kkj-watch
 
 > 日本の官公需(政府・自治体入札)案件の「公告後の変化」— 訂正公告・締切変更・様式差替え — を検知し、応募要件を構造化JSONで返すAPI/MCPサービス。データ源は官公需情報ポータルサイト(中小企業庁)公式検索API。原文の再配布はせず、抽出した事実・差分メタデータ・原典URLのみを提供する。
 
+> EN: kkj-watch monitors Japanese government tenders (kkj.go.jp) for post-publication changes — corrections, deadline changes, document replacements — and returns structured bidding requirements as JSON. Machine-payable via x402 (USDC on Base, $0.02/call, no account needed): GET /paid/requirements/{key}. Free tier: 200 req/day. MCP endpoint: POST /mcp (tools: search_cases, get_case, list_change_events, get_requirements).
+
 ## API (無料ティア: 200リクエスト/日、X-API-Keyで拡張)
 
 - GET /cases?limit=N : 監視中の入札案件一覧(JSON)
