@@ -46,6 +46,17 @@ python -m kkj.mcp_server             # MCPサーバー(stdio)
 
 `GET /cases` `GET /cases/{key}` `GET /events` `GET /stats`(利用ログ計測付き — フェーズ1のゲート判定: ユニーク利用元10件以上+7日以上継続3件以上)
 
+### x402(AIエージェントの自律支払い)
+
+`/paid/requirements/{key}` は [x402プロトコル](https://docs.cdp.coinbase.com/x402/welcome)対応 — **USDC $0.02/コール**(Base mainnet)。
+エージェントは402応答の`accepts`に従いEIP-3009署名を`X-PAYMENT`ヘッダで送るだけでデータを購入できます(アカウント・APIキー不要)。
+
+```
+GET https://5.75.142.199.sslip.io/paid/requirements/{key}
+→ 402 + paymentRequirements
+→ X-PAYMENT付き再リクエスト → 200 + 構造化応募要件JSON
+```
+
 ## 収益モデル(フェーズ2)
 
 - 従量: 1案件の構造化 ¥10〜50(x402 + APIキー併用)
