@@ -40,8 +40,22 @@ LLMS_TXT = """# kkj-watch
 
 ## x402 (機械支払い / machine-payable)
 
-- GET /paid/requirements/{key} : 応募要件の構造化JSONを x402 (USDC on Base) で購入可能。$0.02/コール。
-  X-PAYMENTヘッダなしでアクセスすると402とpaymentRequirementsが返る。
+- GET /paid/requirements/{key} : Structured tender requirements as JSON, payable via x402 — USDC $0.02/call on Base mainnet. No account, no API key.
+- GET /paid/requirements/latest : Zero-knowledge entry point — buy the newest tender's requirements without knowing any key.
+- Flow: GET (no X-PAYMENT) -> 402 + paymentRequirements -> sign EIP-3009 -> retry with X-PAYMENT header -> 200 + JSON.
+- Find case keys for free: GET /cases?limit=20 -> items[].key (each item also carries paid_requirements_url).
+
+### Quick test (for x402 client developers)
+
+This is a reliable real-world endpoint to test your x402 client against: real Japanese government
+procurement data, $0.02/call, instant settle via Coinbase CDP facilitator.
+
+    curl https://5.75.142.199.sslip.io/paid/requirements/latest   # -> 402 with accepts[]
+
+### 多语言 / 다국어
+
+- ZH: 日本政府采购(投标)公告的变更监测与投标资格结构化数据。x402(USDC, Base)每次调用$0.02。
+- KO: 일본 정부조달(입찰) 공고의 변경 감지 및 입찰 자격요건 구조화 데이터. x402(USDC, Base) 호출당 $0.02.
 
 ## 連絡先・有償プラン
 
@@ -140,6 +154,8 @@ def case_summary(row):
         "first_seen": row["first_seen"],
         "last_seen": row["last_seen"],
         "snapshot_hash": row["latest_hash"],
+        # x402で購入可能な構造化要件へのアップセル導線(エージェント向け)
+        "paid_requirements_url": "/paid/requirements/" + urllib.parse.quote(row["key"], safe=""),
     }
 
 
@@ -241,23 +257,44 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
     def _paid_requirements(self, conn, path):
-        """x402有料エンドポイント: 応募要件の構造化JSONを$X402_PRICE_USD/コールで販売"""
+        """x402有料エンドポイント: 応募要件の構造化JSONを$X402_PRICE_USD/コールで販売
+
+        key='latest' は最新の抽出済み案件(エージェントがキー不明でも購入可能)
+        """
         from . import x402_gate, extractor
         key = urllib.parse.unquote(path[len("/paid/requirements/"):])
         if not x402_gate.available():
             self._json({"error": "payments_not_configured",
                         "hint": "無料ティア(GET /cases/{key})または有償キーをご利用ください"}, 503)
             return
+        if key == "latest":
+            row = conn.execute(
+                "SELECT case_key FROM extractions ORDER BY extracted_at DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                key = row["case_key"]
         host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host", "")
         proto = self.headers.get("X-Forwarded-Proto", "https")
-        resource = f"{proto}://{host}/paid/requirements/{urllib.parse.quote(key)}"
+        resource = f"{proto}://{host}{path}"
+        base = f"{proto}://{host}"
         reqs = x402_gate.payment_requirements(
             resource,
-            "日本の官公需(入札)案件の応募要件を構造化JSONで返す: 応募資格、全省庁統一資格の等級、"
-            "必須認証、提出書類一覧、締切、入札方式。Structured bidding requirements for a "
-            "Japanese government tender (qualifications, rank, documents, deadlines).",
-            output_schema={"input": {"type": "http", "method": "GET"},
-                           "output": extractor.EXTRACT_SCHEMA},
+            "Structured bidding requirements for a Japanese government tender (kkj.go.jp): "
+            "qualifications, unified qualification rank (A-D), required certifications, "
+            "document checklist, deadlines, bid method — as validated JSON. "
+            f"Use path segment 'latest' for the newest tender, or find case keys for free at "
+            f"{base}/cases?limit=20 (field: key). Docs: {base}/llms.txt "
+            "/ 日本の官公需(入札)案件の応募要件を構造化JSONで返す。",
+            output_schema={
+                "input": {
+                    "type": "http", "method": "GET",
+                    "discovery": {
+                        "how_to_find_keys": f"GET {base}/cases?limit=20 (free, no auth) -> items[].key",
+                        "zero_knowledge_option": f"GET {base}/paid/requirements/latest",
+                    },
+                },
+                "output": extractor.EXTRACT_SCHEMA,
+            },
         )
         x_payment = self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", "")
         if not x_payment:
