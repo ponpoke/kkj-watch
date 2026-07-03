@@ -54,12 +54,17 @@ def poll_docs(limit=None):
     """未取得または最も古い文書から順に巡回"""
     limit = limit or config.DOC_FETCH_MAX_PER_RUN
     conn = store.connect()
+    # 優先順位: ①未取得 ②締切が14日以内(差替えの実害が最大の層) ③最も古く取得したもの
     rows = conn.execute(
         """SELECT c.key, json_extract(c.latest_json,'$.document_uri') AS url,
-                  (SELECT MAX(fetched_at) FROM documents d WHERE d.case_key=c.key) AS last_fetch
+                  (SELECT MAX(fetched_at) FROM documents d WHERE d.case_key=c.key) AS last_fetch,
+                  substr(coalesce(json_extract(c.latest_json,'$.period_end'),''),1,10) AS deadline
            FROM cases c
            WHERE json_extract(c.latest_json,'$.document_uri') IS NOT NULL
-           ORDER BY last_fetch IS NOT NULL, last_fetch ASC
+           ORDER BY (last_fetch IS NOT NULL),
+                    CASE WHEN deadline >= date('now') AND deadline <= date('now','+14 day')
+                         THEN 0 ELSE 1 END,
+                    last_fetch ASC
            LIMIT ?""",
         (limit,),
     ).fetchall()

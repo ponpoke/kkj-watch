@@ -26,10 +26,10 @@ QUERIES = [
 # 1クエリあたりの取得件数(APIのCountパラメータ)
 FETCH_COUNT = 100
 
-# 原典ドキュメント巡回の設定(robots/利用規約順守: 各ホストへは3秒間隔)
-# 120件/回 × 3時間おき = 全案件の様式差替えを約18時間周期で検知
+# 原典ドキュメント巡回の設定(robots/利用規約順守: 各リクエスト3秒間隔)
+# 240件/回 × 3時間おき = 全周約9時間。締切14日以内の案件は毎回優先再取得
 DOC_FETCH_DELAY_SEC = 3.0
-DOC_FETCH_MAX_PER_RUN = 120
+DOC_FETCH_MAX_PER_RUN = 240
 DOC_FETCH_TIMEOUT = 30
 USER_AGENT = "kkj-watch/0.1 (tender change-detection research; contact: ponzuzuzuzuzu@gmail.com)"
 
