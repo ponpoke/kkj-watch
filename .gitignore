@@ -2,8 +2,9 @@
 data/
 *.log
 
-# 事業戦略・営業文書(非公開)
+# 事業戦略・営業文書(非公開)・秘密情報を含むメモ
 plan
+memo
 docs/sales_onepager.md
 docs/phase0_design.md
 docs/launch_announcement.md

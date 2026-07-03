@@ -183,6 +183,10 @@ def handle(msg):
         except Exception as e:
             return {"jsonrpc": "2.0", "id": mid,
                     "result": {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True}}
+    if method == "resources/list":
+        return {"jsonrpc": "2.0", "id": mid, "result": {"resources": []}}
+    if method == "prompts/list":
+        return {"jsonrpc": "2.0", "id": mid, "result": {"prompts": []}}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if mid is not None:  # 未対応のリクエストにはエラー応答、通知は無視
