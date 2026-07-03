@@ -36,6 +36,11 @@ LLMS_TXT = """# kkj-watch
 - 「クラウド関連で参加資格が等級Bの案件を探し、先週から要件が変わったものを教えて」を1ターンで
 - 入札担当エージェントの締切変更見張り、訂正公告の即時検知
 
+## x402 (機械支払い / machine-payable)
+
+- GET /paid/requirements/{key} : 応募要件の構造化JSONを x402 (USDC on Base) で購入可能。$0.02/コール。
+  X-PAYMENTヘッダなしでアクセスすると402とpaymentRequirementsが返る。
+
 ## 連絡先・有償プラン
 
 - 従量: 構造化¥30/案件+API¥1/リクエスト。月額ウォッチ¥5,000〜
@@ -209,6 +214,8 @@ class Handler(BaseHTTPRequestHandler):
                      "detail": json.loads(r["detail_json"]) if r["detail_json"] else None}
                     for r in rows
                 ])
+            elif path.startswith("/paid/requirements/"):
+                self._paid_requirements(conn, path)
             elif path == "/llms.txt":
                 body = LLMS_TXT.encode("utf-8")
                 self.send_response(200)
@@ -229,6 +236,52 @@ class Handler(BaseHTTPRequestHandler):
                                           "/events?limit=N", "POST /mcp"]}, 404)
         finally:
             conn.close()
+
+    def _paid_requirements(self, conn, path):
+        """x402有料エンドポイント: 応募要件の構造化JSONを$X402_PRICE_USD/コールで販売"""
+        from . import x402_gate, extractor
+        key = urllib.parse.unquote(path[len("/paid/requirements/"):])
+        if not x402_gate.available():
+            self._json({"error": "payments_not_configured",
+                        "hint": "無料ティア(GET /cases/{key})または有償キーをご利用ください"}, 503)
+            return
+        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host", "")
+        proto = self.headers.get("X-Forwarded-Proto", "https")
+        resource = f"{proto}://{host}/paid/requirements/{urllib.parse.quote(key)}"
+        reqs = x402_gate.payment_requirements(
+            resource,
+            "日本の官公需(入札)案件の応募要件を構造化JSONで返す: 応募資格、全省庁統一資格の等級、"
+            "必須認証、提出書類一覧、締切、入札方式。Structured bidding requirements for a "
+            "Japanese government tender (qualifications, rank, documents, deadlines).",
+            output_schema={"input": {"type": "http", "method": "GET"},
+                           "output": extractor.EXTRACT_SCHEMA},
+        )
+        x_payment = self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", "")
+        if not x_payment:
+            self._json(x402_gate.body_402(reqs), 402)
+            return
+        ok, result = x402_gate.verify_and_settle(x_payment, reqs)
+        if not ok:
+            self._json(x402_gate.body_402(reqs, error=result), 402)
+            return
+        row = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (key,)).fetchone()
+        if row:
+            payload = json.loads(row["result_json"])
+        elif extractor.available():
+            try:
+                payload = extractor.extract_case(conn, key)
+                conn.commit()
+            except Exception as e:
+                payload = {"error": f"extraction_failed: {e}"}
+        else:
+            payload = {"error": "not_extracted"}
+        body = json.dumps(payload or {"error": "not_found"}, ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-PAYMENT-RESPONSE", result)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _client_ip(self):
         """リバースプロキシ(Caddy)経由の場合はX-Forwarded-Forから実IPを得る"""
