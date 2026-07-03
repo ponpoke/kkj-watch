@@ -139,6 +139,12 @@ def main():
         watch.digest()
     elif cmd == "backup":
         cmd_backup(int(args[1]) if len(args) > 1 else 14)
+    elif cmd == "link":
+        from . import linker
+        linker.link_corrections(int(args[1]) if len(args) > 1 else 30)
+    elif cmd == "analyze":
+        from . import semantic
+        semantic.analyze_pending_field_events(int(args[1]) if len(args) > 1 else 20)
     elif cmd == "key-issue":
         from . import billing
         plan = args[2] if len(args) > 2 else "metered"

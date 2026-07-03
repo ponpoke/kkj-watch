@@ -248,8 +248,13 @@ class Handler(BaseHTTPRequestHandler):
                 out["extraction"] = json.loads(ext["result_json"]) if ext else None
                 self._json(out)
             elif path == "/events":
+                conn.executescript(
+                    "CREATE TABLE IF NOT EXISTS change_analyses (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " case_key TEXT, event_id INTEGER, kind TEXT, analysis_json TEXT, model TEXT, created_at TEXT);")
                 rows = conn.execute(
-                    """SELECT e.*, json_extract(c.latest_json,'$.project_name') AS name
+                    """SELECT e.*, json_extract(c.latest_json,'$.project_name') AS name,
+                              (SELECT a.analysis_json FROM change_analyses a
+                               WHERE a.event_id=e.id ORDER BY a.id DESC LIMIT 1) AS analysis
                        FROM events e JOIN cases c ON c.key=e.case_key
                        ORDER BY e.id DESC LIMIT ?""",
                     (limit,),
@@ -257,7 +262,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json([
                     {"case_key": r["case_key"], "project_name": r["name"],
                      "type": r["event_type"], "at": r["detected_at"],
-                     "detail": json.loads(r["detail_json"]) if r["detail_json"] else None}
+                     "detail": json.loads(r["detail_json"]) if r["detail_json"] else None,
+                     "analysis": json.loads(r["analysis"]) if r["analysis"] else None}
                     for r in rows
                 ])
             elif path.startswith("/paid/requirements/"):
