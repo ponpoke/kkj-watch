@@ -18,14 +18,18 @@ QUERIES = [
     "ネットワーク構築",
     "情報システム",
     "アプリケーション",
+    # 変更検知の在庫を直接取り込む(官公需の訂正は別公告として出ることが多い)
+    "訂正公告",
+    "変更公告",
 ]
 
 # 1クエリあたりの取得件数(APIのCountパラメータ)
 FETCH_COUNT = 100
 
-# 原典ドキュメント巡回の設定(robots/利用規約順守: 低頻度・少数)
+# 原典ドキュメント巡回の設定(robots/利用規約順守: 各ホストへは3秒間隔)
+# 120件/回 × 3時間おき = 全案件の様式差替えを約18時間周期で検知
 DOC_FETCH_DELAY_SEC = 3.0
-DOC_FETCH_MAX_PER_RUN = 20
+DOC_FETCH_MAX_PER_RUN = 120
 DOC_FETCH_TIMEOUT = 30
 USER_AGENT = "kkj-watch/0.1 (tender change-detection research; contact: ponzuzuzuzuzu@gmail.com)"
 
