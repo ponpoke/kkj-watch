@@ -218,6 +218,11 @@ class Handler(BaseHTTPRequestHandler):
                     "attempts": conn.execute("SELECT COUNT(*) n FROM payment_log").fetchone()["n"],
                     "settled": conn.execute("SELECT COUNT(*) n FROM payment_log WHERE success=1").fetchone()["n"],
                 }
+                try:
+                    from . import llm_budget
+                    out["llm"] = llm_budget.stats(conn)
+                except Exception:
+                    pass
                 self._json(out)
             elif path == "/cases":
                 rows = conn.execute(
@@ -271,6 +276,8 @@ class Handler(BaseHTTPRequestHandler):
                 ])
             elif path.startswith("/paid/requirements/"):
                 self._paid_requirements(conn, path)
+            elif path.startswith("/paid/analyze-now/"):
+                self._paid_analyze_now(conn, path)
             elif path == "/robots.txt":
                 base = self._base_url()
                 body = (f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n"
@@ -429,6 +436,67 @@ a{{color:#0a6}}</style></head><body>
 </body></html>"""
         self._raw(page.encode("utf-8"), "text/html; charset=utf-8")
 
+    def _require_payment(self, conn, reqs, resource):
+        """x402支払いゲート。支払い済みなら(True, settle_b64)、未払いなら402を送って(False, None)"""
+        from . import x402_gate
+        x_payment = self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", "")
+        if not x_payment:
+            self._json(x402_gate.body_402(reqs), 402)
+            return False, None
+        ok, result = x402_gate.verify_and_settle(x_payment, reqs)
+        log_payment_attempt(conn, self._client_ip(), resource, ok,
+                            None if ok else result[:300])
+        if not ok:
+            self._json(x402_gate.body_402(reqs, error=result), 402)
+            return False, None
+        return True, result
+
+    def _paid_analyze_now(self, conn, path):
+        """新規LLM実行を伴う高額エンドポイント($0.30)。ポチった案件だけ課金・解析する"""
+        from . import x402_gate, extractor, semantic
+        key = urllib.parse.unquote(path[len("/paid/analyze-now/"):])
+        if not x402_gate.available():
+            self._json({"error": "payments_not_configured"}, 503)
+            return
+        if key == "latest":
+            r = conn.execute("SELECT key FROM cases ORDER BY first_seen DESC LIMIT 1").fetchone()
+            if r:
+                key = r["key"]
+        row = conn.execute("SELECT latest_json FROM cases WHERE key=?", (key,)).fetchone()
+        if row is None:
+            self._json({"error": "not_found"}, 404)
+            return
+        resource = f"{self._base_url()}{path}"
+        reqs = x402_gate.payment_requirements(
+            resource,
+            "On-demand LLM analysis of a Japanese government tender: extract structured "
+            "bidding requirements (qualifications, rank, documents, deadlines) as validated JSON. "
+            "新規にClaude抽出を実行して返します。",
+            output_schema={"input": {"type": "http", "method": "GET"},
+                           "output": extractor.EXTRACT_SCHEMA},
+            price_usd=0.30,
+        )
+        paid, _ = self._require_payment(conn, reqs, resource)
+        if not paid:
+            return
+        # 支払い後にオンデマンドでLLM抽出(予算ガード内)
+        cached = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (key,)).fetchone()
+        if cached:
+            self._json({"cached": True, "requirements": json.loads(cached["result_json"])})
+            return
+        if not extractor.available():
+            self._json({"error": "llm_unavailable",
+                        "hint": "ANTHROPIC_API_KEY未設定または残高不足。支払いは成立しています — 復旧後に再取得可能です。"}, 200)
+            return
+        try:
+            payload = extractor.extract_case(conn, key, force=True)
+            conn.commit()
+            self._json({"cached": False, "requirements": payload})
+        except semantic.BudgetExceeded as e:
+            self._json({"error": "budget_exceeded", "reason": str(e)}, 200)
+        except Exception as e:
+            self._json({"error": f"analysis_failed: {e}"}, 200)
+
     def _paid_requirements(self, conn, path):
         """x402有料エンドポイント: 応募要件の構造化JSONを$X402_PRICE_USD/コールで販売
 
@@ -469,27 +537,17 @@ a{{color:#0a6}}</style></head><body>
                 "output": extractor.EXTRACT_SCHEMA,
             },
         )
-        x_payment = self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", "")
-        if not x_payment:
-            self._json(x402_gate.body_402(reqs), 402)
+        paid, result = self._require_payment(conn, reqs, resource)
+        if not paid:
             return
-        ok, result = x402_gate.verify_and_settle(x_payment, reqs)
-        log_payment_attempt(conn, self._client_ip(), resource, ok,
-                            None if ok else result[:300])
-        if not ok:
-            self._json(x402_gate.body_402(reqs, error=result), 402)
-            return
+        # x402の低単価エンドポイントは「キャッシュ済みデータのみ」返す(裏でLLMを呼ばない=赤字防止)
         row = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (key,)).fetchone()
         if row:
             payload = json.loads(row["result_json"])
-        elif extractor.available():
-            try:
-                payload = extractor.extract_case(conn, key)
-                conn.commit()
-            except Exception as e:
-                payload = {"error": f"extraction_failed: {e}"}
         else:
-            payload = {"error": "not_extracted"}
+            payload = {"status": "not_yet_extracted",
+                       "hint": "この案件はまだ構造化されていません。新規LLM抽出は /paid/analyze-now/{key} ($0.30) をご利用ください。",
+                       "free_alternative": f"{self._base_url()}/cases/{urllib.parse.quote(key, safe='')}"}
         body = json.dumps(payload or {"error": "not_found"}, ensure_ascii=False, indent=1).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")

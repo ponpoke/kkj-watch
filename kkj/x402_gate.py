@@ -44,12 +44,14 @@ def available() -> bool:
     return bool(config()["pay_to"])
 
 
-def payment_requirements(resource_url: str, description: str, output_schema=None) -> dict:
+def payment_requirements(resource_url: str, description: str, output_schema=None,
+                         price_usd: float | None = None) -> dict:
     cfg = config()
+    price = price_usd if price_usd is not None else cfg["price_usd"]
     req = {
         "scheme": "exact",
         "network": cfg["network"],
-        "maxAmountRequired": str(int(cfg["price_usd"] * 1_000_000)),  # USDC 6 decimals
+        "maxAmountRequired": str(int(round(price * 1_000_000))),  # USDC 6 decimals
         "resource": resource_url,
         "description": description,
         "mimeType": "application/json",
