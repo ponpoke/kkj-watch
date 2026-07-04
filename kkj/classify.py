@@ -35,6 +35,55 @@ _EXPLICIT = re.compile(
     r"\d{1,2}[月/]\d{1,2}日?|\d{1,2}[:時]\d{2}|令和\d|平成\d|\d{4}年"
     r"|[0-9,]+円|[0-9.]+[%％]|\d+[かヶケカ][月年]|\d+日間|[ABCD]等級")
 
+# ルールベースの重要度タグ(LLM不要)。買い手AIはこのタグで自分の文脈に要約できる。
+TAG_PATTERNS = {
+    "price_affecting": re.compile(
+        r"金額|予定価格|上限額|予算|費用に含め|見積|単価|円|価格"),
+    "deadline_affecting": re.compile(
+        r"締切|提出期限|入札日|開札|納入期限|履行期限|期間|日時|延長|前倒"),
+    "eligibility_affecting": re.compile(
+        r"資格|等級|ISO|ISMS|[Pp]マーク|プライバシーマーク|認証|実績|技術者|地域要件|参加要件"),
+    "document_affecting": re.compile(
+        r"様式|提出書類|仕様書|別紙|要領|添付|フォーマット"),
+    "qa_related": re.compile(r"質疑|回答書|質問|Q&A|Ｑ＆Ａ"),
+    "cancellation": re.compile(r"中止|取消|取り消し"),
+    "postponement": re.compile(r"延期|順延"),
+}
+
+# タグ → flags/category の対応
+_FLAG_OF = {
+    "price_affecting": "affects_price",
+    "deadline_affecting": "affects_deadline",
+    "eligibility_affecting": "affects_eligibility",
+    "document_affecting": "affects_documents",
+}
+
+
+def tag_change(field, event_type, before, after, quote=None):
+    """変更テキストから重要度タグ・flags・カテゴリを機械抽出(LLM不要)"""
+    blob = " ".join(str(x) for x in (field, event_type, before, after, quote) if x)
+    tags = [name for name, pat in TAG_PATTERNS.items() if pat.search(blob)]
+    flags = {v: False for v in ("affects_price", "affects_deadline",
+                                "affects_eligibility", "affects_documents", "requires_action")}
+    for t in tags:
+        if t in _FLAG_OF:
+            flags[_FLAG_OF[t]] = True
+    material = bool(tags) or event_type in (
+        "deadline_changed", "requirement_added", "requirement_removed",
+        "requirement_changed", "cancellation", "postponement", "document_replaced")
+    flags["requires_action"] = material
+    if "cancellation" in tags:
+        category = "cancellation"
+    elif "price_affecting" in tags:
+        category = "cost_affecting"
+    elif "eligibility_affecting" in tags:
+        category = "eligibility_affecting"
+    elif "deadline_affecting" in tags:
+        category = "schedule_affecting"
+    else:
+        category = "informational"
+    return tags, flags, category, material
+
 
 def _impact(field, et, before, after):
     label = FIELD_LABEL.get(field, field)
@@ -64,11 +113,16 @@ def machine_analysis(diff: dict) -> dict:
             et = "requirement_added" if before in (None, "") else "requirement_removed"
         blob = f"{before} {after}"
         conf = "high" if _EXPLICIT.search(blob) else "medium"
+        tags, flags, category, material = tag_change(field, et, before, after)
         changes.append({
             "event_type": et,
+            "change_category": category,
             "before": before,
             "after": after,
-            "impact": _impact(field, et, before, after),
+            "impact": _impact(field, et, before, after),   # 短い定型文(任意)
+            "impact_tags": tags,                            # AI向けの主データ
+            "flags": flags,
+            "material": material,
             "confidence": conf,
             "confidence_basis": "explicit_values" if conf == "high" else "field_change_only",
             "source_quote": None,       # 機械分類は原文引用を持たない(LLM層が付与)
@@ -76,4 +130,5 @@ def machine_analysis(diff: dict) -> dict:
         })
         labels.append(FIELD_LABEL.get(field, field))
     summary = "、".join(dict.fromkeys(labels)) + " が変更されました。" if labels else "変更あり。"
-    return {"summary": summary, "changes": changes, "engine": "rule"}
+    return {"summary": summary, "changes": changes, "engine": "rule",
+            "material": any(c["material"] for c in changes)}

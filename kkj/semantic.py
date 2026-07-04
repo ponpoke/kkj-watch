@@ -63,22 +63,43 @@ def available() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
-def _llm(prompt: str) -> dict:
-    body = {
-        "model": config.EXTRACT_MODEL,
-        "max_tokens": 2048,
-        "output_config": {"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
-        "messages": [{"role": "user", "content": prompt[:24000]}],
-    }
-    req = urllib.request.Request(
-        API_URL, data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json",
-                 "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                 "anthropic-version": "2023-06-01"},
-        method="POST")
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read())
-    return json.loads(next(b["text"] for b in data["content"] if b["type"] == "text"))
+class BudgetExceeded(Exception):
+    """予算・上限超過でLLMを呼ばなかった(pendingとして扱う)"""
+
+
+def _llm(prompt: str, cache_key: str | None = None) -> dict:
+    """予算ガード+キャッシュ付きLLM呼び出し。cache_keyがあればヒット時はAPIを呼ばない"""
+    from . import llm_budget, store as _store
+    conn = _store.connect()
+    try:
+        if cache_key:
+            cached = llm_budget.cache_get(conn, cache_key)
+            if cached is not None:
+                return cached
+        ok, reason = llm_budget.can_spend(conn)
+        if not ok:
+            raise BudgetExceeded(reason)
+        body = {
+            "model": config.EXTRACT_MODEL,
+            "max_tokens": 2048,
+            "output_config": {"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
+            "messages": [{"role": "user", "content": prompt[:24000]}],
+        }
+        req = urllib.request.Request(
+            API_URL, data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                     "anthropic-version": "2023-06-01"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+        result = json.loads(next(b["text"] for b in data["content"] if b["type"] == "text"))
+        if cache_key:
+            llm_budget.record_call(conn, cache_key)
+            llm_budget.cache_put(conn, cache_key, result)
+        return result
+    finally:
+        conn.close()
 
 
 import re
@@ -122,12 +143,15 @@ def analyze_pair(title: str, before_text: str, after_text: str, source: str,
     provenance: {"source_kind","source_url","original_key","correction_key"} 等を
     そのまま結果に添付(LLM出力ではなくシステムが保証するメタデータ)
     """
+    from . import llm_budget
+    ck = llm_budget.cache_key(f"{title}\0{before_text}", after_text, config.EXTRACT_MODEL)
     analysis = _llm(
         "以下は日本の官公需(入札)案件の変更前後の内容です。入札参加者にとって意味のある変更を"
         "分類して抽出してください。原文にない情報は捏造せず、確認できないものはconfidenceを下げてください。"
         "source_quoteには根拠となる原文の一節をそのまま引用してください(言い換え禁止)。\n"
         f"案件名: {title}\n情報源: {source}\n\n"
-        f"=== 変更前 ===\n{before_text[:10000]}\n\n=== 変更後 ===\n{after_text[:10000]}"
+        f"=== 変更前 ===\n{before_text[:10000]}\n\n=== 変更後 ===\n{after_text[:10000]}",
+        cache_key=ck,
     )
     analysis = harden_confidence(analysis)
     if provenance:
