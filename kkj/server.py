@@ -169,13 +169,13 @@ def classify_usage(path, user_agent, query_has_filter):
     return "probe_access"   # /, /stats, /.well-known/*, /llms.txt, /robots.txt 等
 
 
-def log_usage(conn, client, user_agent, path, query_has_filter=False):
+def log_usage(conn, client, user_agent, path, query_has_filter=False, is_test=False):
     conn.executescript(USAGE_SCHEMA)
     try:
         conn.execute("ALTER TABLE usage_log ADD COLUMN usage_class TEXT")
     except sqlite3.OperationalError:
         pass
-    uclass = classify_usage(path, user_agent, query_has_filter)
+    uclass = "test" if is_test else classify_usage(path, user_agent, query_has_filter)
     conn.execute(
         "INSERT INTO usage_log(at, client, user_agent, path, usage_class) VALUES (?,?,?,?,?)",
         (store.now_utc(), client, user_agent, path, uclass),
@@ -262,7 +262,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(err[1], err[0])
                 return
             _has_filter = bool(qs.get("tag") or qs.get("query") or qs.get("q") or qs.get("impact"))
-            log_usage(conn, client, self.headers.get("User-Agent"), path, _has_filter)
+            _is_test = bool(self.headers.get("X-KKJ-Test"))   # 自己検証は計測から除外
+            log_usage(conn, client, self.headers.get("User-Agent"), path, _has_filter, _is_test)
             if path == "/stats":
                 out = {}
                 for t in ("cases", "snapshots", "events", "extractions"):
