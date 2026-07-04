@@ -472,11 +472,32 @@ a{{color:#0a6}}</style></head><body>
         if row is None:                                   # 要件2: 案件存在確認
             self._json({"error": "not_found", "case_key": key}, 404)
             return
-        # 要件6: 既に解析済みなら二重課金せず無料でキャッシュを返す
-        cached = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (key,)).fetchone()
+        base = self._base_url()
+        resource = f"{base}{path}"
+
+        # 要件3: 支払い済みジョブの retry_token 持参時は、再支払いなしで結果を返す
+        token = (self.headers.get("X-Retry-Token")
+                 or urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("retry_token", [""])[0])
+        if token:
+            job = paid.get(conn, token)
+            if job is not None and job["resource"] == resource:
+                if job["status"] == "succeeded" and job["result_json"]:
+                    self._json({"cached": True, "requirements": json.loads(job["result_json"]),
+                                "retry_token": token})
+                else:
+                    self._run_analysis_job(conn, token, key, None)
+                return
+            self._json({"error": "invalid_retry_token"}, 403)
+            return
+
+        # 要件1,2: 既に解析済みでも、未払いでは requirements 本体を返さない($0.02課金の迂回を防止)
+        cached = conn.execute("SELECT 1 FROM extractions WHERE case_key=?", (key,)).fetchone()
         if cached is not None:
-            self._json({"cached": True, "requirements": json.loads(cached["result_json"]),
-                        "note": "既に解析済みです。以後は /paid/requirements/{key} ($0.02) でも取得できます。"})
+            self._json({
+                "error": "already_analyzed",
+                "hint": "この案件は既に解析済みです。構造化データは /paid/requirements/{key} ($0.02) から取得してください。",
+                "requirements_url": f"{base}/paid/requirements/{urllib.parse.quote(key, safe='')}",
+            }, 409)
             return
         # 要件2,3: 支払い要求の前にLLM可用性・予算・入力サイズを確認。失敗時は402を出さない
         if not extractor.available():
@@ -497,7 +518,6 @@ a{{color:#0a6}}</style></head><body>
                         "hint": "対象文書が大きすぎます。支払いは発生しません。"}, 413)
             return
 
-        resource = f"{self._base_url()}{path}"
         reqs = x402_gate.payment_requirements(
             resource,
             "On-demand LLM analysis of a Japanese government tender: extract structured "
@@ -517,13 +537,12 @@ a{{color:#0a6}}</style></head><body>
             self._json({"error": "payment_reused",
                         "hint": "この支払いは別のリソースで既に使用されています。"}, 409)
             return
-        token = job["retry_token"]
         # 既に完了済みのジョブ(同一支払いの再取得)ならその結果を返す
         if job["status"] == "succeeded" and job["result_json"]:
             self._json({"cached": True, "requirements": json.loads(job["result_json"]),
-                        "retry_token": token})
+                        "retry_token": job["retry_token"]})
             return
-        self._run_analysis_job(conn, token, key, settlement)
+        self._run_analysis_job(conn, job["retry_token"], key, settlement)
 
     def _run_analysis_job(self, conn, token, key, settlement):
         """支払い済みジョブのLLM解析を実行。失敗しても再支払いなしで再実行できるよう記録する"""

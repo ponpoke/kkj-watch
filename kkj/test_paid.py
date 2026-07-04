@@ -93,10 +93,19 @@ def main():
           f"(got {st})")
     os.environ["LLM_MONTHLY_BUDGET_USD"] = "5"
 
-    # 要件6: 抽出済み案件の analyze-now は課金せず cached:true
+    # 要件1,5: 解析済み案件でも analyze-now を未払いで叩くと requirements 本体を返さない(課金バイパス防止)
     st, body = get(port, "/paid/analyze-now/EXTRACTED")
-    check("解析済みは analyze-now でも課金せず cached:true",
-          st == 200 and body.get("cached") is True, f"(got {st})")
+    check("解析済みでも未払いなら requirements を返さない(課金バイパス防止)",
+          st == 409 and body.get("error") == "already_analyzed" and "requirements" not in body,
+          f"(got {st}, keys={list(body)})")
+
+    # 要件2: 解析済みは /paid/requirements へ誘導される
+    check("解析済みは /paid/requirements へ誘導", "requirements_url" in body)
+
+    # 要件3: 無効な retry_token は結果を返さない(403)
+    st, body = get(port, "/paid/analyze-now/EXTRACTED?retry_token=bogus")
+    check("無効な retry_token は結果を返さない(403)",
+          st == 403 and "requirements" not in body, f"(got {st})")
 
     httpd.shutdown()
 
@@ -118,6 +127,12 @@ def main():
     done = paid.get(conn, job["retry_token"])
     check("retry_without_repayment: 再実行で succeeded + 結果取得",
           done["status"] == "succeeded" and json.loads(done["result_json"])["qualifications"] == ["X"])
+
+    # 要件4: /paid/job は pending の間は requirements 本体を返さない
+    ph2 = paid.payment_hash("PAYMENT_Y")
+    pending_job, _ = paid.claim(conn, ph2, "https://h/paid/analyze-now/C", "C", "settle2")
+    check("新規ジョブは pending", pending_job["status"] == "pending")
+    check("pending ジョブは結果(result_json)を持たない", pending_job["result_json"] is None)
     conn.close()
 
     print(f"\n{'ALL PASS' if not FAILED else 'FAILED: ' + ', '.join(FAILED)}")
