@@ -1,5 +1,8 @@
 # kkj-watch — 入札案件の変更検知・要件構造化エンジン
 
+> **Free machine-readable feed for Japanese procurement changes. Paid endpoints provide cached structured requirements and on-demand extraction.**
+> Free: `/events` (filter `?tag=`), `/cases?query=`, `/sample-diff`, `/agent.json`. Paid (x402): `/paid/requirements/{key}` ($0.02, cached), `/paid/analyze-now/{key}` ($0.30, fresh LLM).
+
 **🌐 公開サービス: https://5.75.142.199.sslip.io/ (無料ティア 200リクエスト/日)**
 
 ```json

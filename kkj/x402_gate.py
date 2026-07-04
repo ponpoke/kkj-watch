@@ -65,8 +65,11 @@ def payment_requirements(resource_url: str, description: str, output_schema=None
     return req
 
 
-def body_402(requirements: dict, error="X-PAYMENT header is required") -> dict:
-    return {"x402Version": 1, "error": error, "accepts": [requirements]}
+def body_402(requirements: dict, error="X-PAYMENT header is required", free=None) -> dict:
+    body = {"x402Version": 1, "error": error, "accepts": [requirements]}
+    if free:
+        body["free_alternatives"] = free   # 購入前に無料で価値を確認できる導線(要件3)
+    return body
 
 
 def _cdp_jwt(method: str, path: str) -> str:

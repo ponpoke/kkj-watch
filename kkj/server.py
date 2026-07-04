@@ -8,6 +8,7 @@
   GET /events?limit=N      変更イベント(訂正・差替え検知)フィード
 """
 import json
+import sqlite3
 import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,49 +18,53 @@ from . import store
 
 LLMS_TXT = """# kkj-watch
 
-> 日本の官公需(政府・自治体入札)案件の「公告後の変化」— 訂正公告・締切変更・様式差替え — を検知し、応募要件を構造化JSONで返すAPI/MCPサービス。データ源は官公需情報ポータルサイト(中小企業庁)公式検索API。原文の再配布はせず、抽出した事実・差分メタデータ・原典URLのみを提供する。
+> Free, machine-readable feed of change intelligence for Japanese public procurement (government tenders):
+> corrections, deadline changes, requirement changes, and tender-document replacements — with before/after,
+> impact tags, source quotes, source URLs, and observation timestamps. Paid endpoints provide cached
+> structured requirements and on-demand LLM extraction. Source: kkj.go.jp (official procurement portal API).
+> We never redistribute original PDFs — only extracted facts, diffs, and links.
 
-> EN: kkj-watch monitors Japanese government tenders (kkj.go.jp) for post-publication changes — corrections, deadline changes, document replacements — and returns structured bidding requirements as JSON. Machine-payable via x402 (USDC on Base, $0.02/call, no account needed): GET /paid/requirements/{key}. Free tier: 200 req/day. MCP endpoint: POST /mcp (tools: search_cases, get_case, list_change_events, get_requirements).
+## Free endpoints (use these first)
 
-## API (無料ティア: 200リクエスト/日、X-API-Keyで拡張)
+- GET /events : recent procurement change events (before/after, impact_tags, source_quote, source_url, observed_at)
+- GET /events?tag=deadline_affecting : filter by impact (deadline_affecting | eligibility_affecting |
+  price_affecting | document_affecting | qa_related | cancellation | postponement)
+- GET /cases?query=cloud : free keyword search of monitored tenders (returns case keys)
+- GET /cases/{key} : full evidence for one tender (snapshot history + change events + cached requirements if any)
+- GET /sample-diff : one representative change event, so an agent can see the data shape before buying
+- GET /agent.json : machine-readable discovery of all endpoints
 
-- GET /cases?limit=N : 監視中の入札案件一覧(JSON)
-- GET /cases/{key} : 案件詳細+スナップショット履歴(SHA-256証跡)+変更イベント+抽出済み応募要件
-- GET /events?limit=N : 変更イベント(FIELD_CHANGED/DOC_CHANGED)フィード。フィールド単位のbefore/after付き
-- GET /stats : 蓄積状況
+## Paid endpoints (only when you need structured requirements)
 
-## MCP (Streamable HTTP)
+- GET /paid/requirements/{key} : cached structured bidding requirements as validated JSON.
+  $0.02 via x402 (USDC on Base). Returns 402 only if a cached extraction exists; otherwise 409 (use analyze-now).
+- GET /paid/analyze-now/{key} : run a fresh LLM extraction on demand. $0.30 via x402.
+  Use only when no cached extraction exists (i.e. /paid/requirements returned 409 cache_not_available).
 
-- エンドポイント: POST /mcp
-- ツール: search_cases(キーワード検索) / get_case(詳細) / list_change_events(変更フィード) / get_requirements(応募資格・全省庁統一資格等級・提出書類・締切の構造化JSON)
+x402 flow: GET (no X-PAYMENT) -> 402 + paymentRequirements (with free_alternatives) -> sign EIP-3009 ->
+retry with X-PAYMENT header -> 200 + JSON (+ retry_token for re-fetch without re-paying).
 
-## ユースケース
+## MCP (Streamable HTTP: POST /mcp)
 
-- 「クラウド関連で参加資格が等級Bの案件を探し、先週から要件が変わったものを教えて」を1ターンで
-- 入札担当エージェントの締切変更見張り、訂正公告の即時検知
+Tools (purpose-named): list_japan_procurement_changes (free, ?tag= filter) /
+find_tender_deadline_changes (free keyword search) / get_tender_change_evidence (free, full evidence) /
+get_cached_tender_requirements (cached structured requirements; points to paid analyze-now if not cached).
 
-## x402 (機械支払い / machine-payable)
+## When to use what
 
-- GET /paid/requirements/{key} : Structured tender requirements as JSON, payable via x402 — USDC $0.02/call on Base mainnet. No account, no API key.
-- GET /paid/requirements/latest : Zero-knowledge entry point — buy the newest tender's requirements without knowing any key.
-- Flow: GET (no X-PAYMENT) -> 402 + paymentRequirements -> sign EIP-3009 -> retry with X-PAYMENT header -> 200 + JSON.
-- Find case keys for free: GET /cases?limit=20 -> items[].key (each item also carries paid_requirements_url).
+- Just want the change feed? -> GET /events (free). Filter with ?tag=.
+- Need to know if you qualify / what to submit? -> GET /paid/requirements/{key} (cached, $0.02).
+- No cached data yet for that tender? -> GET /paid/analyze-now/{key} ($0.30, runs extraction).
 
-### Quick test (for x402 client developers)
+## 多语言 / 다국어 / 日本語
 
-This is a reliable real-world endpoint to test your x402 client against: real Japanese government
-procurement data, $0.02/call, instant settle via Coinbase CDP facilitator.
+- JA: 日本の官公需(入札)の「公告後の変化」検知フィード。無料の /events + 有料の構造化要件($0.02〜)。
+- ZH: 日本政府采购(投标)公告变更的机器可读免费信息流。付费端点提供结构化投标资格数据。
+- KO: 일본 정부조달(입찰) 공고 변경의 기계 판독 가능 무료 피드. 유료 엔드포인트는 구조화된 입찰 자격 데이터 제공.
 
-    curl https://5.75.142.199.sslip.io/paid/requirements/latest   # -> 402 with accepts[]
+## Contact
 
-### 多语言 / 다국어
-
-- ZH: 日本政府采购(投标)公告的变更监测与投标资格结构化数据。x402(USDC, Base)每次调用$0.02。
-- KO: 일본 정부조달(입찰) 공고의 변경 감지 및 입찰 자격요건 구조화 데이터. x402(USDC, Base) 호출당 $0.02.
-
-## 連絡先・有償プラン
-
-- 従量: 構造化¥30/案件+API¥1/リクエスト。月額ウォッチ¥5,000〜
+ponzuzuzuzuzu@gmail.com — human plans: monthly watch from JPY 5,000/company.
 - ponzuzuzuzuzu@gmail.com
 """
 
@@ -141,18 +146,50 @@ def log_payment_attempt(conn, client, resource, success, error):
     conn.commit()
 
 
-def log_usage(conn, client, user_agent, path):
+import re as _re
+# プローバ/クローラ/監視の User-Agent。これらは「利用者」に数えない(要件8)
+_PROBE_UA = _re.compile(
+    r"probe|observer|uptime|monitor|discovery|explorer|station|pulse|scan|crawl|bot|spider|curl|wget",
+    _re.I)
+# 実データを取得する無料エンドポイント(意図ある利用)
+_FREE_DATA_PATHS = ("/events", "/sample-diff")
+
+
+def classify_usage(path, user_agent, query_has_filter):
+    """アクセスを probe_access / free_agent_use / paid_intent に分類(paid_conversionは決済ログ側)"""
+    ua = user_agent or ""
+    if path.startswith("/paid/"):
+        return "paid_intent"
+    is_data = (path in _FREE_DATA_PATHS or path.startswith("/cases"))
+    if is_data:
+        # プローバUAでも、タグ/クエリ付きの具体的な取得は「使っている」と見なす
+        if _PROBE_UA.search(ua) and not query_has_filter:
+            return "probe_access"
+        return "free_agent_use"
+    return "probe_access"   # /, /stats, /.well-known/*, /llms.txt, /robots.txt 等
+
+
+def log_usage(conn, client, user_agent, path, query_has_filter=False):
     conn.executescript(USAGE_SCHEMA)
+    try:
+        conn.execute("ALTER TABLE usage_log ADD COLUMN usage_class TEXT")
+    except sqlite3.OperationalError:
+        pass
+    uclass = classify_usage(path, user_agent, query_has_filter)
     conn.execute(
-        "INSERT INTO usage_log(at, client, user_agent, path) VALUES (?,?,?,?)",
-        (store.now_utc(), client, user_agent, path),
+        "INSERT INTO usage_log(at, client, user_agent, path, usage_class) VALUES (?,?,?,?,?)",
+        (store.now_utc(), client, user_agent, path, uclass),
     )
     conn.commit()
 
 
 def usage_stats(conn):
-    """フェーズ1ゲート判定用: ユニーク利用元数と7日以上継続利用元数"""
+    """フェーズ1ゲート判定用 + 4段階ファネル(要件7)"""
     conn.executescript(USAGE_SCHEMA)
+    try:
+        conn.execute("ALTER TABLE usage_log ADD COLUMN usage_class TEXT")
+    except sqlite3.OperationalError:
+        pass
     uniq = conn.execute("SELECT COUNT(DISTINCT client) n FROM usage_log").fetchone()["n"]
     sustained = conn.execute(
         """SELECT COUNT(*) n FROM (
@@ -160,8 +197,25 @@ def usage_stats(conn):
              HAVING julianday(MAX(at)) - julianday(MIN(at)) >= 7
            )"""
     ).fetchone()["n"]
-    return {"unique_clients": uniq, "sustained_7d_clients": sustained,
-            "gate": "unique>=10 and sustained>=3"}
+    # 段階別のユニーク外部利用元(プローバはfree_agent_useに数えない)
+    def uniq_of(cls):
+        return conn.execute(
+            "SELECT COUNT(DISTINCT client) n FROM usage_log WHERE usage_class=? "
+            "AND client NOT IN ('127.0.0.1','::1','5.75.142.199')", (cls,)).fetchone()["n"]
+    conn.executescript(PAYMENT_LOG_SCHEMA)
+    paid_conv = conn.execute(
+        "SELECT COUNT(DISTINCT client) n FROM payment_log WHERE success=1 "
+        "AND client NOT IN ('127.0.0.1','::1','5.75.142.199')").fetchone()["n"]
+    return {
+        "unique_clients": uniq, "sustained_7d_clients": sustained,
+        "gate": "unique>=10 and sustained>=3",
+        "funnel": {
+            "probe_access": uniq_of("probe_access"),
+            "free_agent_use": uniq_of("free_agent_use"),
+            "paid_intent": uniq_of("paid_intent"),
+            "paid_conversion": paid_conv,
+        },
+    }
 
 
 def case_summary(row):
@@ -207,7 +261,8 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 self._json(err[1], err[0])
                 return
-            log_usage(conn, client, self.headers.get("User-Agent"), path)
+            _has_filter = bool(qs.get("tag") or qs.get("query") or qs.get("q") or qs.get("impact"))
+            log_usage(conn, client, self.headers.get("User-Agent"), path, _has_filter)
             if path == "/stats":
                 out = {}
                 for t in ("cases", "snapshots", "events", "extractions"):
@@ -257,24 +312,12 @@ class Handler(BaseHTTPRequestHandler):
                 out["extraction"] = json.loads(ext["result_json"]) if ext else None
                 self._json(out)
             elif path == "/events":
-                conn.executescript(
-                    "CREATE TABLE IF NOT EXISTS change_analyses (id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                    " case_key TEXT, event_id INTEGER, kind TEXT, analysis_json TEXT, model TEXT, created_at TEXT);")
-                rows = conn.execute(
-                    """SELECT e.*, json_extract(c.latest_json,'$.project_name') AS name,
-                              (SELECT a.analysis_json FROM change_analyses a
-                               WHERE a.event_id=e.id ORDER BY a.id DESC LIMIT 1) AS analysis
-                       FROM events e JOIN cases c ON c.key=e.case_key
-                       ORDER BY e.id DESC LIMIT ?""",
-                    (limit,),
-                ).fetchall()
-                self._json([
-                    {"case_key": r["case_key"], "project_name": r["name"],
-                     "type": r["event_type"], "at": r["detected_at"],
-                     "detail": json.loads(r["detail_json"]) if r["detail_json"] else None,
-                     "analysis": json.loads(r["analysis"]) if r["analysis"] else None}
-                    for r in rows
-                ])
+                tag = (qs.get("tag") or qs.get("impact") or [""])[0]
+                self._events_feed(conn, limit, tag)
+            elif path == "/sample-diff":
+                self._sample_diff(conn)
+            elif path in ("/agent.json", "/agents"):
+                self._agent_json(conn)
             elif path.startswith("/paid/requirements/"):
                 self._paid_requirements(conn, path)
             elif path.startswith("/paid/analyze-now/"):
@@ -317,6 +360,138 @@ class Handler(BaseHTTPRequestHandler):
         host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host", "")
         proto = self.headers.get("X-Forwarded-Proto", "https")
         return f"{proto}://{host}"
+
+    def _events_feed(self, conn, limit, tag=""):
+        """無料の変更イベントフィード。tag= で impact_tags 絞り込み(要件6)"""
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS change_analyses (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " case_key TEXT, event_id INTEGER, kind TEXT, analysis_json TEXT, model TEXT, created_at TEXT);")
+        # タグ絞り込み時は多めに取ってからPythonでフィルタ
+        fetch = limit if not tag else min(limit * 8, 2000)
+        rows = conn.execute(
+            """SELECT e.*, json_extract(c.latest_json,'$.project_name') AS name,
+                      json_extract(c.latest_json,'$.document_uri') AS src,
+                      (SELECT a.analysis_json FROM change_analyses a
+                       WHERE a.event_id=e.id ORDER BY a.id DESC LIMIT 1) AS analysis
+               FROM events e JOIN cases c ON c.key=e.case_key
+               ORDER BY e.id DESC LIMIT ?""",
+            (fetch,),
+        ).fetchall()
+        base = self._base_url()
+        out = []
+        for r in rows:
+            analysis = json.loads(r["analysis"]) if r["analysis"] else None
+            if tag:
+                changes = (analysis or {}).get("changes", [])
+                if not any(tag in (ch.get("impact_tags") or []) for ch in changes):
+                    continue
+            kq = urllib.parse.quote(r["case_key"], safe="")
+            out.append({
+                "case_key": r["case_key"], "project_name": r["name"],
+                "type": r["event_type"], "observed_at": r["detected_at"],
+                "source_url": r["src"],
+                "detail": json.loads(r["detail_json"]) if r["detail_json"] else None,
+                "analysis": analysis,
+                "free_evidence": f"{base}/case/{kq}",
+                "paid_requirements": f"{base}/paid/requirements/{kq}",
+            })
+            if len(out) >= limit:
+                break
+        self._json({
+            "service": "kkj-watch",
+            "feed": "Japanese public procurement change events (free)",
+            "filter": {"tag": tag} if tag else None,
+            "available_tags": ["deadline_affecting", "eligibility_affecting", "price_affecting",
+                               "document_affecting", "qa_related", "cancellation", "postponement"],
+            "count": len(out),
+            "events": out,
+        })
+
+    def _sample_diff(self, conn):
+        """無料サンプル: 実データに近い1件の変更イベント(要件2)。外部AIが価値を理解するための入口"""
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS change_analyses (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " case_key TEXT, event_id INTEGER, kind TEXT, analysis_json TEXT, model TEXT, created_at TEXT);")
+        base = self._base_url()
+        row = conn.execute(
+            """SELECT a.analysis_json, a.case_key, e.detected_at,
+                      json_extract(c.latest_json,'$.document_uri') AS src,
+                      json_extract(c.latest_json,'$.project_name') AS name
+               FROM change_analyses a
+               JOIN events e ON e.id=a.event_id
+               JOIN cases c ON c.key=a.case_key
+               WHERE a.analysis_json LIKE '%impact_tags%'
+               ORDER BY a.id DESC LIMIT 50""").fetchone()
+        sample = None
+        if row:
+            analysis = json.loads(row["analysis_json"])
+            ch = next((c for c in analysis.get("changes", []) if c.get("impact_tags")),
+                      (analysis.get("changes") or [None])[0])
+            if ch:
+                kq = urllib.parse.quote(row["case_key"], safe="")
+                sample = {
+                    "project_name": row["name"],
+                    "event_type": ch.get("event_type"),
+                    "change_category": ch.get("change_category"),
+                    "impact_tags": ch.get("impact_tags"),
+                    "flags": ch.get("flags"),
+                    "before": ch.get("before"),
+                    "after": ch.get("after"),
+                    "source_quote": ch.get("source_quote"),
+                    "source_url": row["src"],
+                    "observed_at": row["detected_at"],
+                    "confidence": ch.get("confidence"),
+                    "confidence_basis": ch.get("confidence_basis"),
+                    "paid_upgrade": f"{base}/paid/requirements/{kq}",
+                }
+        if sample is None:  # フォールバック(代表例)
+            sample = {
+                "event_type": "requirement_added",
+                "change_category": "cost_affecting",
+                "impact_tags": ["price_affecting", "document_affecting"],
+                "flags": {"affects_price": True, "affects_documents": True, "requires_action": True},
+                "before": None,
+                "after": "クラウドサービスの利用期間は18カ月とし、本調達の費用に含めること。",
+                "source_quote": "クラウドサービスの利用期間は18カ月とし、本調達の費用に含めること。",
+                "source_url": "https://example.go.jp/tender/....pdf",
+                "observed_at": "2026-07-03T00:15:00+09:00",
+                "confidence": "high", "confidence_basis": "explicit_values_in_quote",
+                "paid_upgrade": f"{base}/paid/requirements/{{key}}",
+            }
+        self._json({
+            "service": "kkj-watch",
+            "description": "Sample of a Japanese procurement change event. "
+                           "Free feed: /events (filter with ?tag=). "
+                           "Full structured requirements: /paid/requirements/{key} ($0.02, x402).",
+            "sample": sample,
+            "free_feed": f"{base}/events",
+            "docs": f"{base}/llms.txt",
+        })
+
+    def _agent_json(self, conn):
+        """外部エージェント向けの機械可読ディスカバリ(要件2)"""
+        base = self._base_url()
+        self._json({
+            "service": "kkj-watch",
+            "description": "Machine-readable feed of Japanese public procurement amendments, "
+                           "corrections, deadline changes, and tender document changes.",
+            "free_endpoints": {
+                "recent_changes": f"{base}/events",
+                "filter_by_impact": f"{base}/events?tag=deadline_affecting",
+                "tender_search": f"{base}/cases?query=cloud",
+                "sample": f"{base}/sample-diff",
+                "evidence_page": f"{base}/case/{{key}}",
+            },
+            "paid_endpoints": {
+                "cached_requirements": f"{base}/paid/requirements/{{key}} ($0.02, x402 USDC on Base)",
+                "on_demand_analysis": f"{base}/paid/analyze-now/{{key}} ($0.30, runs LLM extraction)",
+            },
+            "impact_tags": ["deadline_affecting", "eligibility_affecting", "price_affecting",
+                            "document_affecting", "qa_related", "cancellation", "postponement"],
+            "mcp": f"{base}/mcp",
+            "payment": {"protocol": "x402", "network": "base", "asset": "USDC"},
+            "docs": f"{base}/llms.txt",
+        })
 
     def _raw(self, body, ctype, status=200):
         try:
@@ -439,13 +614,21 @@ a{{color:#0a6}}</style></head><body>
 </body></html>"""
         self._raw(page.encode("utf-8"), "text/html; charset=utf-8")
 
+    def _free_hint(self, case_key):
+        base = self._base_url()
+        kq = urllib.parse.quote(case_key, safe="")
+        return {"free_preview": f"{base}/case/{kq}",
+                "free_recent_events": f"{base}/events",
+                "sample_diff": f"{base}/sample-diff",
+                "paid_upgrade": f"{base}/paid/requirements/{kq}"}
+
     def _settle_and_claim(self, conn, reqs, resource, case_key):
         """x402支払いゲート+ジョブ確保。戻り値: job行(成功) / None(応答送信済み)。
         同一支払いの再送は再settleせず既存ジョブを返す(冪等)。別resource再利用は409。"""
         from . import x402_gate, paid
         x_payment = self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", "")
         if not x_payment:
-            self._json(x402_gate.body_402(reqs), 402)   # 未払い → 支払い要求
+            self._json(x402_gate.body_402(reqs, free=self._free_hint(case_key)), 402)
             return None
         ph = paid.payment_hash(x_payment)
         # 冪等化: 同一X-PAYMENTが既に記録済みなら再settleしない
@@ -461,7 +644,7 @@ a{{color:#0a6}}</style></head><body>
         log_payment_attempt(conn, self._client_ip(), resource, ok,
                             None if ok else result[:300])
         if not ok:
-            self._json(x402_gate.body_402(reqs, error=result), 402)
+            self._json(x402_gate.body_402(reqs, error=result, free=self._free_hint(case_key)), 402)
             return None
         job, err = paid.claim(conn, ph, resource, case_key, result)
         if err == "payment_reused":   # 競合(同時リクエスト)時の保険

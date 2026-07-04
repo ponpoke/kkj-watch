@@ -93,14 +93,25 @@ def link_corrections(limit=30, analyze=None):
         ev_id = conn.execute(
             "SELECT id FROM events WHERE case_key=? AND event_type='CORRECTION_NOTICE' ORDER BY id DESC LIMIT 1",
             (orig["key"],)).fetchone()[0]
+        from . import classify
+        tags, flags, category, _ = classify.tag_change(
+            "document", "document_replaced", orec.get("project_name"),
+            title + " " + (rec.get("project_description") or ""))
+        if "document_affecting" not in tags:
+            tags.append("document_affecting")   # 訂正公告は本質的に文書変更
+            flags["affects_documents"] = True
         semantic.save(conn, orig["key"], ev_id, "correction_rule", {
             "summary": f"訂正・変更公告が出ています:「{title[:50]}」",
             "changes": [{
                 "event_type": "document_replaced",
+                "change_category": category,
                 "before": orec.get("project_name"),
                 "after": title,
                 "impact": "この案件に訂正・変更公告が出ています。締切・要件・様式が更新された可能性があるため、"
                           "原典公告で内容を確認してください。",
+                "impact_tags": tags,
+                "flags": flags,
+                "material": True,
                 "confidence": "high",
                 "confidence_basis": "title_marker",
                 "source_quote": title[:400],

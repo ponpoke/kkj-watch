@@ -14,40 +14,54 @@ PROTOCOL_VERSION = "2025-06-18"
 
 TOOLS = [
     {
-        "name": "search_cases",
-        "description": "監視中の官公需(入札)案件をキーワードで検索する。件名・機関名・本文に対する部分一致。",
+        "name": "list_japan_procurement_changes",
+        "description": "List recent change events in Japanese public procurement (government tenders): "
+                       "corrections, deadline changes, requirement changes, document replacements. "
+                       "Free. Filter by impact with tag= (deadline_affecting / eligibility_affecting / "
+                       "price_affecting / document_affecting). 官公需の変更イベント一覧(無料)。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "検索キーワード(例: クラウド)"},
-                "limit": {"type": "integer", "description": "最大件数(既定20)"},
+                "tag": {"type": "string",
+                        "description": "impact tag filter (e.g. deadline_affecting)"},
+                "limit": {"type": "integer", "description": "max items (default 20)"},
+            },
+        },
+    },
+    {
+        "name": "find_tender_deadline_changes",
+        "description": "Search monitored Japanese tenders by keyword (matches title, agency, body). "
+                       "Free. Returns case keys usable with get_tender_change_evidence / "
+                       "get_cached_tender_requirements. キーワードで入札案件を検索(無料)。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "keyword (e.g. cloud / クラウド)"},
+                "limit": {"type": "integer", "description": "max items (default 20)"},
             },
             "required": ["query"],
         },
     },
     {
-        "name": "get_case",
-        "description": "案件キーを指定して詳細(全フィールド・スナップショット履歴・変更イベント・抽出済み応募要件)を取得する。",
+        "name": "get_tender_change_evidence",
+        "description": "Get full evidence for one tender: all fields, snapshot history (SHA-256 audit trail), "
+                       "change events with before/after and impact tags, plus cached structured requirements "
+                       "if available. Free. 案件の変更根拠一式を取得(無料)。",
         "inputSchema": {
             "type": "object",
-            "properties": {"key": {"type": "string", "description": "案件キー(search_casesが返すkey)"}},
+            "properties": {"key": {"type": "string", "description": "case key"}},
             "required": ["key"],
         },
     },
     {
-        "name": "list_change_events",
-        "description": "訂正公告・締切変更・様式差替えなどの変更イベントを新しい順に取得する。入札担当者が最も見落としやすい情報。",
+        "name": "get_cached_tender_requirements",
+        "description": "Get structured bidding requirements (qualifications, unified-qualification rank A-D, "
+                       "certifications, document checklist, deadlines, bid method) as validated JSON. "
+                       "Returns cached data if available; otherwise indicates paid on-demand analysis is needed. "
+                       "応募要件の構造化JSON(キャッシュ優先)。",
         "inputSchema": {
             "type": "object",
-            "properties": {"limit": {"type": "integer", "description": "最大件数(既定20)"}},
-        },
-    },
-    {
-        "name": "get_requirements",
-        "description": "案件の応募要件(応募資格・全省庁統一資格等級・必須認証・提出書類・締切)を構造化JSONで返す。未抽出ならその場で抽出を試みる。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"key": {"type": "string", "description": "案件キー"}},
+            "properties": {"key": {"type": "string", "description": "case key"}},
             "required": ["key"],
         },
     },
@@ -110,43 +124,59 @@ def tool_get_case(args):
 
 def tool_list_change_events(args):
     limit = min(int(args.get("limit", 20)), 100)
+    tag = args.get("tag") or ""
     conn = store.connect()
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS change_analyses (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " case_key TEXT, event_id INTEGER, kind TEXT, analysis_json TEXT, model TEXT, created_at TEXT);")
+    fetch = limit if not tag else min(limit * 8, 1000)
     rows = conn.execute(
         """SELECT e.*, json_extract(c.latest_json,'$.project_name') AS name,
-                  json_extract(c.latest_json,'$.organization_name') AS org
+                  json_extract(c.latest_json,'$.organization_name') AS org,
+                  json_extract(c.latest_json,'$.document_uri') AS src,
+                  (SELECT a.analysis_json FROM change_analyses a
+                   WHERE a.event_id=e.id ORDER BY a.id DESC LIMIT 1) AS analysis
            FROM events e JOIN cases c ON c.key=e.case_key
            WHERE e.event_type != 'NEW_CASE'
            ORDER BY e.id DESC LIMIT ?""",
-        (limit,),
+        (fetch,),
     ).fetchall()
-    out = [
-        {"case_key": r["case_key"], "project_name": r["name"], "organization": r["org"],
-         "type": r["event_type"], "at": r["detected_at"],
-         "detail": json.loads(r["detail_json"]) if r["detail_json"] else None}
-        for r in rows
-    ]
+    out = []
+    for r in rows:
+        analysis = json.loads(r["analysis"]) if r["analysis"] else None
+        if tag:
+            changes = (analysis or {}).get("changes", [])
+            if not any(tag in (ch.get("impact_tags") or []) for ch in changes):
+                continue
+        out.append({
+            "case_key": r["case_key"], "project_name": r["name"], "organization": r["org"],
+            "type": r["event_type"], "observed_at": r["detected_at"], "source_url": r["src"],
+            "analysis": analysis})
+        if len(out) >= limit:
+            break
     conn.close()
     return out
 
 
 def tool_get_requirements(args):
+    """キャッシュ済み構造化要件を返す。未抽出は有料オンデマンド解析へ誘導(裏でLLMを呼ばない=コスト制御)"""
     conn = store.connect()
     ext = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (args["key"],)).fetchone()
+    conn.close()
     if ext:
-        conn.close()
-        return json.loads(ext["result_json"])
-    if not extractor.available():
-        conn.close()
-        return {"error": "not_extracted", "reason": "ANTHROPIC_API_KEY未設定のためオンデマンド抽出は不可"}
-    try:
-        result = extractor.extract_case(conn, args["key"])
-        conn.commit()
-        return result if result is not None else {"error": "not_found_or_no_text"}
-    finally:
-        conn.close()
+        return {"cached": True, "requirements": json.loads(ext["result_json"])}
+    return {"cached": False, "status": "not_yet_extracted",
+            "hint": "この案件はまだ構造化されていません。新規解析は有料エンドポイント "
+                    "/paid/analyze-now/{key} ($0.30) をご利用ください。"}
 
 
 HANDLERS = {
+    # 目的ベースの新名(外部エージェント向け)
+    "find_tender_deadline_changes": tool_search_cases,
+    "get_tender_change_evidence": tool_get_case,
+    "list_japan_procurement_changes": tool_list_change_events,
+    "get_cached_tender_requirements": tool_get_requirements,
+    # 旧名は後方互換のエイリアスとして維持
     "search_cases": tool_search_cases,
     "get_case": tool_get_case,
     "list_change_events": tool_list_change_events,
