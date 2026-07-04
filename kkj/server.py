@@ -219,8 +219,9 @@ class Handler(BaseHTTPRequestHandler):
                     "settled": conn.execute("SELECT COUNT(*) n FROM payment_log WHERE success=1").fetchone()["n"],
                 }
                 try:
-                    from . import llm_budget
+                    from . import llm_budget, paid
                     out["llm"] = llm_budget.stats(conn)
+                    out["paid_jobs"] = paid.stats(conn)
                 except Exception:
                     pass
                 self._json(out)
@@ -278,6 +279,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._paid_requirements(conn, path)
             elif path.startswith("/paid/analyze-now/"):
                 self._paid_analyze_now(conn, path)
+            elif path.startswith("/paid/job/"):
+                self._paid_job(conn, path)
             elif path == "/robots.txt":
                 base = self._base_url()
                 body = (f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n"
@@ -451,9 +454,12 @@ a{{color:#0a6}}</style></head><body>
             return False, None
         return True, result
 
+    MAX_ANALYZE_INPUT_CHARS = 60000
+
     def _paid_analyze_now(self, conn, path):
-        """新規LLM実行を伴う高額エンドポイント($0.30)。ポチった案件だけ課金・解析する"""
-        from . import x402_gate, extractor, semantic
+        """新規LLM実行を伴う高額エンドポイント($0.30)。ポチった案件だけ課金・解析する。
+        支払い要求(402)を出す前に全ての事前確認を行い、paid-but-denied を防ぐ。"""
+        from . import x402_gate, extractor, llm_budget, paid
         key = urllib.parse.unquote(path[len("/paid/analyze-now/"):])
         if not x402_gate.available():
             self._json({"error": "payments_not_configured"}, 503)
@@ -463,9 +469,34 @@ a{{color:#0a6}}</style></head><body>
             if r:
                 key = r["key"]
         row = conn.execute("SELECT latest_json FROM cases WHERE key=?", (key,)).fetchone()
-        if row is None:
-            self._json({"error": "not_found"}, 404)
+        if row is None:                                   # 要件2: 案件存在確認
+            self._json({"error": "not_found", "case_key": key}, 404)
             return
+        # 要件6: 既に解析済みなら二重課金せず無料でキャッシュを返す
+        cached = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (key,)).fetchone()
+        if cached is not None:
+            self._json({"cached": True, "requirements": json.loads(cached["result_json"]),
+                        "note": "既に解析済みです。以後は /paid/requirements/{key} ($0.02) でも取得できます。"})
+            return
+        # 要件2,3: 支払い要求の前にLLM可用性・予算・入力サイズを確認。失敗時は402を出さない
+        if not extractor.available():
+            self._json({"error": "llm_unavailable",
+                        "hint": "現在この案件の新規解析はできません(APIキー未設定または残高不足)。"
+                                "支払いは発生しません。"}, 503)
+            return
+        can, reason = llm_budget.can_spend(conn)
+        if not can:
+            self._json({"error": "budget_exceeded", "reason": reason,
+                        "hint": "LLM予算上限に達しています。支払いは発生しません。時間をおいて再度お試しください。"}, 429)
+            return
+        rec = json.loads(row["latest_json"])
+        text = rec.get("project_description") or rec.get("project_name") or ""
+        if len(text) > self.MAX_ANALYZE_INPUT_CHARS:      # 要件2: 入力サイズ上限
+            self._json({"error": "input_too_large",
+                        "chars": len(text), "limit": self.MAX_ANALYZE_INPUT_CHARS,
+                        "hint": "対象文書が大きすぎます。支払いは発生しません。"}, 413)
+            return
+
         resource = f"{self._base_url()}{path}"
         reqs = x402_gate.payment_requirements(
             resource,
@@ -476,33 +507,76 @@ a{{color:#0a6}}</style></head><body>
                            "output": extractor.EXTRACT_SCHEMA},
             price_usd=0.30,
         )
-        paid, _ = self._require_payment(conn, reqs, resource)
-        if not paid:
+        is_paid, settlement = self._require_payment(conn, reqs, resource)
+        if not is_paid:
             return
-        # 支払い後にオンデマンドでLLM抽出(予算ガード内)
-        cached = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (key,)).fetchone()
-        if cached:
-            self._json({"cached": True, "requirements": json.loads(cached["result_json"])})
+        # 要件5: 同一支払いの再利用防止 & 要件4: ジョブ記録(以後 retry_token で再取得)
+        ph = paid.payment_hash(self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", ""))
+        job, err = paid.claim(conn, ph, resource, key, settlement)
+        if err == "payment_reused":
+            self._json({"error": "payment_reused",
+                        "hint": "この支払いは別のリソースで既に使用されています。"}, 409)
             return
-        if not extractor.available():
-            self._json({"error": "llm_unavailable",
-                        "hint": "ANTHROPIC_API_KEY未設定または残高不足。支払いは成立しています — 復旧後に再取得可能です。"}, 200)
+        token = job["retry_token"]
+        # 既に完了済みのジョブ(同一支払いの再取得)ならその結果を返す
+        if job["status"] == "succeeded" and job["result_json"]:
+            self._json({"cached": True, "requirements": json.loads(job["result_json"]),
+                        "retry_token": token})
             return
+        self._run_analysis_job(conn, token, key, settlement)
+
+    def _run_analysis_job(self, conn, token, key, settlement):
+        """支払い済みジョブのLLM解析を実行。失敗しても再支払いなしで再実行できるよう記録する"""
+        from . import extractor, semantic, paid, llm_budget
         try:
             payload = extractor.extract_case(conn, key, force=True)
             conn.commit()
-            self._json({"cached": False, "requirements": payload})
+            if payload is None:
+                raise RuntimeError("no_extractable_text")
+            llm_budget.record_call(conn, f"analyze:{key}")   # 月次コスト追跡に計上
+            paid.finish(conn, token, "succeeded", payload)
+            resp = {"cached": False, "requirements": payload, "retry_token": token}
+            status = 200
         except semantic.BudgetExceeded as e:
-            self._json({"error": "budget_exceeded", "reason": str(e)}, 200)
+            paid.finish(conn, token, "pending", error=f"budget:{e}")
+            resp = {"status": "pending", "retry_token": token, "reason": str(e),
+                    "hint": "支払いは成立しています。予算回復後に GET /paid/job/{retry_token} で再取得できます(再支払い不要)。"}
+            status = 202
         except Exception as e:
-            self._json({"error": f"analysis_failed: {e}"}, 200)
+            paid.finish(conn, token, "pending", error=str(e)[:300])
+            resp = {"status": "pending", "retry_token": token, "reason": str(e)[:200],
+                    "hint": "支払いは成立しています。GET /paid/job/{retry_token} で再取得できます(再支払い不要)。"}
+            status = 202
+        body = json.dumps(resp, ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if settlement:
+            self.send_header("X-PAYMENT-RESPONSE", settlement)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _paid_job(self, conn, path):
+        """要件4: 支払い済みジョブの再取得・再実行(再支払い不要)"""
+        from . import paid
+        token = urllib.parse.unquote(path[len("/paid/job/"):])
+        job = paid.get(conn, token)
+        if job is None:
+            self._json({"error": "job_not_found"}, 404)
+            return
+        if job["status"] == "succeeded" and job["result_json"]:
+            self._json({"cached": True, "requirements": json.loads(job["result_json"]),
+                        "retry_token": token})
+            return
+        # 未完了 → 再実行(既に支払い済みなので課金しない)
+        self._run_analysis_job(conn, token, job["case_key"], None)
 
     def _paid_requirements(self, conn, path):
         """x402有料エンドポイント: 応募要件の構造化JSONを$X402_PRICE_USD/コールで販売
 
         key='latest' は最新の抽出済み案件(エージェントがキー不明でも購入可能)
         """
-        from . import x402_gate, extractor
+        from . import x402_gate, extractor, paid
         key = urllib.parse.unquote(path[len("/paid/requirements/"):])
         if not x402_gate.available():
             self._json({"error": "payments_not_configured",
@@ -514,10 +588,24 @@ a{{color:#0a6}}</style></head><body>
             ).fetchone()
             if row:
                 key = row["case_key"]
-        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host", "")
-        proto = self.headers.get("X-Forwarded-Proto", "https")
-        resource = f"{proto}://{host}{path}"
-        base = f"{proto}://{host}"
+        base = self._base_url()
+        # 要件1: 案件が存在しなければ404(支払い要求を出さない)
+        if conn.execute("SELECT 1 FROM cases WHERE key=?", (key,)).fetchone() is None:
+            self._json({"error": "not_found", "case_key": key}, 404)
+            return
+        # 要件1: キャッシュ済みデータが無ければ402を出さず409(paid-but-denied防止)
+        cached = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (key,)).fetchone()
+        if cached is None:
+            self._json({
+                "error": "cache_not_available",
+                "hint": "この案件はまだ構造化されていません。支払いは不要です。"
+                        "新規解析が必要な場合は /paid/analyze-now/{key} ($0.30)、"
+                        "無料の生データは /cases/{key} をご利用ください。",
+                "analyze_now": f"{base}/paid/analyze-now/{urllib.parse.quote(key, safe='')}",
+                "free_alternative": f"{base}/cases/{urllib.parse.quote(key, safe='')}",
+            }, 409)
+            return
+        resource = f"{base}{path}"
         reqs = x402_gate.payment_requirements(
             resource,
             "Structured bidding requirements for a Japanese government tender (kkj.go.jp): "
@@ -537,18 +625,22 @@ a{{color:#0a6}}</style></head><body>
                 "output": extractor.EXTRACT_SCHEMA,
             },
         )
-        paid, result = self._require_payment(conn, reqs, resource)
-        if not paid:
+        is_paid, result = self._require_payment(conn, reqs, resource)
+        if not is_paid:
             return
-        # x402の低単価エンドポイントは「キャッシュ済みデータのみ」返す(裏でLLMを呼ばない=赤字防止)
-        row = conn.execute("SELECT result_json FROM extractions WHERE case_key=?", (key,)).fetchone()
-        if row:
-            payload = json.loads(row["result_json"])
-        else:
-            payload = {"status": "not_yet_extracted",
-                       "hint": "この案件はまだ構造化されていません。新規LLM抽出は /paid/analyze-now/{key} ($0.30) をご利用ください。",
-                       "free_alternative": f"{self._base_url()}/cases/{urllib.parse.quote(key, safe='')}"}
-        body = json.dumps(payload or {"error": "not_found"}, ensure_ascii=False, indent=1).encode("utf-8")
+        # 要件5: 同一支払いの別resource再利用を拒否
+        ph = paid.payment_hash(self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", ""))
+        job, err = paid.claim(conn, ph, resource, key, result)
+        if err == "payment_reused":
+            self._json({"error": "payment_reused",
+                        "hint": "この支払いは別のリソースで既に使用されています。"}, 409)
+            return
+        # キャッシュ済みデータを返す(裏でLLMを呼ばない=赤字防止)
+        payload = json.loads(cached["result_json"])
+        paid.finish(conn, job["retry_token"], "succeeded", payload)
+        body = json.dumps({"cached": True, "requirements": payload,
+                           "retry_token": job["retry_token"]},
+                          ensure_ascii=False, indent=1).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("X-PAYMENT-RESPONSE", result)
