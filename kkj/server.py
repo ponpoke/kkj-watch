@@ -439,20 +439,35 @@ a{{color:#0a6}}</style></head><body>
 </body></html>"""
         self._raw(page.encode("utf-8"), "text/html; charset=utf-8")
 
-    def _require_payment(self, conn, reqs, resource):
-        """x402支払いゲート。支払い済みなら(True, settle_b64)、未払いなら402を送って(False, None)"""
-        from . import x402_gate
+    def _settle_and_claim(self, conn, reqs, resource, case_key):
+        """x402支払いゲート+ジョブ確保。戻り値: job行(成功) / None(応答送信済み)。
+        同一支払いの再送は再settleせず既存ジョブを返す(冪等)。別resource再利用は409。"""
+        from . import x402_gate, paid
         x_payment = self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", "")
         if not x_payment:
-            self._json(x402_gate.body_402(reqs), 402)
-            return False, None
+            self._json(x402_gate.body_402(reqs), 402)   # 未払い → 支払い要求
+            return None
+        ph = paid.payment_hash(x_payment)
+        # 冪等化: 同一X-PAYMENTが既に記録済みなら再settleしない
+        existing = paid.get_by_payment(conn, ph)
+        if existing is not None:
+            if existing["resource"] != resource:
+                self._json({"error": "payment_reused",
+                            "hint": "この支払いは別のリソースで既に使用されています。"}, 409)
+                return None
+            return existing   # 同一payment+同一resource → 既存ジョブを返す(再settleなし)
+        # 新規支払い → ファシリテータで検証・決済
         ok, result = x402_gate.verify_and_settle(x_payment, reqs)
         log_payment_attempt(conn, self._client_ip(), resource, ok,
                             None if ok else result[:300])
         if not ok:
             self._json(x402_gate.body_402(reqs, error=result), 402)
-            return False, None
-        return True, result
+            return None
+        job, err = paid.claim(conn, ph, resource, case_key, result)
+        if err == "payment_reused":   # 競合(同時リクエスト)時の保険
+            self._json({"error": "payment_reused"}, 409)
+            return None
+        return job
 
     MAX_ANALYZE_INPUT_CHARS = 60000
 
@@ -480,7 +495,8 @@ a{{color:#0a6}}</style></head><body>
                  or urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("retry_token", [""])[0])
         if token:
             job = paid.get(conn, token)
-            if job is not None and job["resource"] == resource:
+            # retry_token は秘密トークン(所持=支払い証跡)。ホスト非依存で case_key に紐付けて照合
+            if job is not None and job["case_key"] == key:
                 if job["status"] == "succeeded" and job["result_json"]:
                     self._json({"cached": True, "requirements": json.loads(job["result_json"]),
                                 "retry_token": token})
@@ -527,22 +543,15 @@ a{{color:#0a6}}</style></head><body>
                            "output": extractor.EXTRACT_SCHEMA},
             price_usd=0.30,
         )
-        is_paid, settlement = self._require_payment(conn, reqs, resource)
-        if not is_paid:
-            return
-        # 要件5: 同一支払いの再利用防止 & 要件4: ジョブ記録(以後 retry_token で再取得)
-        ph = paid.payment_hash(self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", ""))
-        job, err = paid.claim(conn, ph, resource, key, settlement)
-        if err == "payment_reused":
-            self._json({"error": "payment_reused",
-                        "hint": "この支払いは別のリソースで既に使用されています。"}, 409)
-            return
-        # 既に完了済みのジョブ(同一支払いの再取得)ならその結果を返す
+        job = self._settle_and_claim(conn, reqs, resource, key)
+        if job is None:
+            return   # 402 / 409 応答は送信済み
+        # 既に完了済みのジョブ(同一支払いの再送)ならその結果を返す
         if job["status"] == "succeeded" and job["result_json"]:
             self._json({"cached": True, "requirements": json.loads(job["result_json"]),
                         "retry_token": job["retry_token"]})
             return
-        self._run_analysis_job(conn, job["retry_token"], key, settlement)
+        self._run_analysis_job(conn, job["retry_token"], key, job["settlement"])
 
     def _run_analysis_job(self, conn, token, key, settlement):
         """支払い済みジョブのLLM解析を実行。失敗しても再支払いなしで再実行できるよう記録する"""
@@ -644,16 +653,9 @@ a{{color:#0a6}}</style></head><body>
                 "output": extractor.EXTRACT_SCHEMA,
             },
         )
-        is_paid, result = self._require_payment(conn, reqs, resource)
-        if not is_paid:
-            return
-        # 要件5: 同一支払いの別resource再利用を拒否
-        ph = paid.payment_hash(self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", ""))
-        job, err = paid.claim(conn, ph, resource, key, result)
-        if err == "payment_reused":
-            self._json({"error": "payment_reused",
-                        "hint": "この支払いは別のリソースで既に使用されています。"}, 409)
-            return
+        job = self._settle_and_claim(conn, reqs, resource, key)
+        if job is None:
+            return   # 402 / 409 応答は送信済み
         # キャッシュ済みデータを返す(裏でLLMを呼ばない=赤字防止)
         payload = json.loads(cached["result_json"])
         paid.finish(conn, job["retry_token"], "succeeded", payload)
@@ -662,7 +664,8 @@ a{{color:#0a6}}</style></head><body>
                           ensure_ascii=False, indent=1).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("X-PAYMENT-RESPONSE", result)
+        if job["settlement"]:
+            self.send_header("X-PAYMENT-RESPONSE", job["settlement"])
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

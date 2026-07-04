@@ -68,6 +68,12 @@ def get(conn, token):
     return conn.execute("SELECT * FROM paid_jobs WHERE retry_token=?", (token,)).fetchone()
 
 
+def get_by_payment(conn, ph):
+    """支払いハッシュから既存ジョブを引く(再settle回避・冪等化のため)"""
+    ensure(conn)
+    return conn.execute("SELECT * FROM paid_jobs WHERE payment_hash=?", (ph,)).fetchone()
+
+
 def stats(conn):
     ensure(conn)
     out = {}

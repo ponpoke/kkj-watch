@@ -54,8 +54,32 @@ python -m kkj.mcp_server             # MCPサーバー(stdio)
 ```
 GET https://5.75.142.199.sslip.io/paid/requirements/{key}
 → 402 + paymentRequirements
-→ X-PAYMENT付き再リクエスト → 200 + 構造化応募要件JSON
+→ X-PAYMENT付き再リクエスト → 200 + 構造化応募要件JSON(+ retry_token)
 ```
+
+**エンドポイントと課金:**
+
+| エンドポイント | 価格 | 内容 |
+|---|---|---|
+| `GET /events` `/cases` | 無料 | 変更履歴・案件一覧(タグ付き) |
+| `GET /paid/requirements/{key}` | $0.02 | キャッシュ済みの構造化データのみ。未解析なら課金せず409 |
+| `GET /paid/analyze-now/{key}` | $0.30 | 新規LLM解析(支払い前に可用性・予算・サイズを事前確認) |
+| `GET /paid/job/{retry_token}` | 無料 | 支払い済みジョブの再取得(再課金なし) |
+
+**paid-but-denied を出さない設計:**
+
+- キャッシュが無い/LLMが実行できない時は**支払い要求(402)を出しません**(409 / 503 / 429 で返す)
+- 支払い後にLLMが失敗(429/529/残高切れ/タイムアウト)しても、応答の `retry_token` で**再支払いなし再取得**できます。
+  事前チェックは「LLMが確実に成功する」ことまでは保証しません(実残高はAnthropicを呼ぶまで不明)。
+  正確には「**実行可能性を事前確認し、失敗時は `retry_token` で再取得可能**」です。
+- `retry_token` は URL クエリでも受け付けますが、**`X-Retry-Token` ヘッダ推奨**(クエリはサーバログ・履歴に残るため):
+
+```
+GET /paid/analyze-now/{key}
+X-Retry-Token: <前回の応答で得たトークン>
+```
+
+- 同一 `X-PAYMENT` の同一リソースへの再送は**再決済せず同じ結果**を返します(冪等)。別リソースでの再利用は 409。
 
 ## 収益モデル(フェーズ2)
 

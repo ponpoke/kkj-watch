@@ -107,6 +107,20 @@ def main():
     check("無効な retry_token は結果を返さない(403)",
           st == 403 and "requirements" not in body, f"(got {st})")
 
+    # 要件3: 支払い済みの有効な retry_token(case_key一致)は再課金なしで結果を返す
+    c2 = store.connect()
+    j, _ = paid.claim(c2, paid.payment_hash("PAY_E2E"),
+                      "https://any/paid/analyze-now/EXTRACTED", "EXTRACTED", "s")
+    paid.finish(c2, j["retry_token"], "succeeded", {"qualifications": ["Z"]})
+    c2.close()
+    st, body = get(port, "/paid/analyze-now/EXTRACTED?retry_token=" + j["retry_token"])
+    check("有効な retry_token は再課金なしで結果を返す(ホスト非依存)",
+          st == 200 and body.get("cached") is True
+          and body.get("requirements", {}).get("qualifications") == ["Z"], f"(got {st})")
+    # 別case_keyのtokenは拒否(トークン横流し防止)
+    st, body = get(port, "/paid/analyze-now/UNEXTRACTED?retry_token=" + j["retry_token"])
+    check("別case_keyへのtoken使用は403", st == 403, f"(got {st})")
+
     httpd.shutdown()
 
     # 要件5: 同一支払いの別resource再利用を拒否
@@ -118,6 +132,10 @@ def main():
     check("同一支払いの別resource再利用を拒否", err2 == "payment_reused")
     job_same, err3 = paid.claim(conn, ph, "https://h/paid/analyze-now/A", "A", "settle1")
     check("同一支払い・同一resourceの再取得は許可", err3 is None and job_same["retry_token"] == job["retry_token"])
+    # 点3: get_by_payment で同一支払いの既存ジョブを引ける(再settle回避)
+    found = paid.get_by_payment(conn, ph)
+    check("get_by_payment: 同一支払いの既存ジョブを引ける",
+          found is not None and found["retry_token"] == job["retry_token"])
 
     # 要件4: 支払い後失敗 → retry_token で再取得(再支払い不要)
     paid.finish(conn, job["retry_token"], "pending", error="429 rate limit")
