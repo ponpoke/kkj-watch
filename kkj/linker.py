@@ -5,6 +5,7 @@
 """
 import difflib
 import json
+import os
 import re
 
 from . import semantic, store
@@ -55,8 +56,11 @@ def find_original(conn, correction):
     return best if best_score >= 0.75 else None
 
 
-def link_corrections(limit=30, analyze=True):
+def link_corrections(limit=30, analyze=None):
     """未紐付けの訂正系公告を元公告へリンクし、意味差分を生成"""
+    # analyze未指定なら「クレジットがあるときだけLLM意味づけ」= コスト自動制御
+    if analyze is None:
+        analyze = semantic.available() and os.environ.get("KKJ_LINK_LLM") == "1"
     conn = store.connect()
     conn.executescript(semantic.SCHEMA_SQL)
     rows = conn.execute(
@@ -85,6 +89,26 @@ def link_corrections(limit=30, analyze=True):
         conn.execute(
             "INSERT INTO events(case_key, event_type, detected_at, detail_json) VALUES (?,?,?,?)",
             (r["key"], "CORRECTION_LINKED", ts, json.dumps(detail, ensure_ascii=False)))
+        # 機械的フォールバック(LLM不要): クレジットゼロでも訂正紐付けに意味を付ける
+        ev_id = conn.execute(
+            "SELECT id FROM events WHERE case_key=? AND event_type='CORRECTION_NOTICE' ORDER BY id DESC LIMIT 1",
+            (orig["key"],)).fetchone()[0]
+        semantic.save(conn, orig["key"], ev_id, "correction_rule", {
+            "summary": f"訂正・変更公告が出ています:「{title[:50]}」",
+            "changes": [{
+                "event_type": "document_replaced",
+                "before": orec.get("project_name"),
+                "after": title,
+                "impact": "この案件に訂正・変更公告が出ています。締切・要件・様式が更新された可能性があるため、"
+                          "原典公告で内容を確認してください。",
+                "confidence": "high",
+                "confidence_basis": "title_marker",
+                "source_quote": title[:400],
+            }],
+            "engine": "rule",
+            "source": {"source_kind": "訂正・変更公告", "source_url": rec.get("document_uri"),
+                       "original_key": orig["key"], "correction_key": r["key"]},
+        })
         conn.commit()
         linked += 1
         print(f"linked: {title[:40]} -> {orec.get('project_name','')[:40]}")

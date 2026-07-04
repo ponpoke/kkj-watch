@@ -8,4 +8,3 @@ WorkingDirectory=/opt/kkj-watch
 EnvironmentFile=/etc/kkj-watch.env
 ExecStart=/usr/bin/python3 -m kkj.pipeline poll
 ExecStart=/usr/bin/python3 -m kkj.pipeline link 50
-ExecStart=/usr/bin/python3 -m kkj.pipeline analyze 30

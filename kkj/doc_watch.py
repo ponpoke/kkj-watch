@@ -140,10 +140,12 @@ def poll_docs(limit=None):
 
 
 def _analyze_doc_diff(conn, case_key, url, old_text, new_text):
-    """PDF差替えの新旧本文を意味差分(両版のテキストがある場合のみ)"""
+    """PDF差替えの新旧本文を意味差分(両版のテキスト+LLMクレジットがある場合のみ)"""
+    import os
     from . import semantic
-    if not (old_text and new_text and semantic.available()):
-        return
+    if not (old_text and new_text and semantic.available()
+            and os.environ.get("KKJ_DOC_LLM") == "1"):
+        return  # コスト制御: 既定はLLMを使わず、DOC_CHANGEDの事実検知まで
     try:
         import json as _json
         rec = _json.loads(conn.execute(

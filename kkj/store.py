@@ -110,10 +110,23 @@ def upsert_case(conn, record: dict):
         "INSERT INTO snapshots(case_key, fetched_at, hash, raw_json) VALUES (?,?,?,?)",
         (key, ts, h, raw),
     )
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO events(case_key, event_type, detected_at, detail_json) VALUES (?,?,?,?)",
         (key, "FIELD_CHANGED", ts, json.dumps(diff, ensure_ascii=False)),
     )
+    # 機械的意味づけ(LLM不要・コストゼロ)を即付与
+    try:
+        from . import classify
+        analysis = classify.machine_analysis(diff)
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS change_analyses (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " case_key TEXT, event_id INTEGER, kind TEXT, analysis_json TEXT, model TEXT, created_at TEXT);")
+        conn.execute(
+            "INSERT INTO change_analyses(case_key, event_id, kind, analysis_json, model, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (key, cur.lastrowid, "rule", json.dumps(analysis, ensure_ascii=False), "rule", ts))
+    except Exception:
+        pass
     return "FIELD_CHANGED"
 
 
