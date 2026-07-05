@@ -226,6 +226,14 @@ def build_resource_leaf(conn, r):
     return record
 
 
+def _row_get(row, col):
+    """sqlite3.Row から安全に取得(列が無ければNone)"""
+    try:
+        return row[col]
+    except (KeyError, IndexError):
+        return None
+
+
 def _has(row, col):
     """sqlite3.Row にその列が存在するか(値のNull有無ではなく列の有無)"""
     try:
@@ -259,6 +267,41 @@ def _init(conn):
     """attest系テーブルを初期化(スキーマ + 列マイグレーション)"""
     conn.executescript(SCHEMA_SQL)
     _migrate_leaves(conn)
+    try:
+        # leaves_available=0 は「公開genesis checkpoint(葉を持たない)」を表す
+        conn.execute(
+            "ALTER TABLE daily_roots ADD COLUMN leaves_available INTEGER NOT NULL DEFAULT 1")
+    except Exception:
+        pass
+
+
+def published_root_hash(date):
+    """roots/ または public_roots/ に公開済みの root_hash(なければNone)"""
+    for d in (ROOT_DIR, PUBLIC_ROOTS_DIR):
+        f = d / f"{date}.root.json"
+        if f.exists():
+            try:
+                return json.load(open(f, encoding="utf-8")).get("root_hash")
+            except Exception:
+                pass
+    return None
+
+
+def is_published(date):
+    return published_root_hash(date) is not None
+
+
+def is_proof_available(conn, date):
+    """制約6: 公開rootとDB rootが整合し、かつ葉がある日付のみ proof を返せる"""
+    _init(conn)
+    row = conn.execute(
+        "SELECT root_hash, leaves_available FROM daily_roots WHERE date=?", (date,)).fetchone()
+    if row is None or not row["leaves_available"]:
+        return False
+    ph = published_root_hash(date)
+    if ph is None:
+        return True                    # public_roots未書込は稀。DBに葉があれば内部的に可
+    return ph == row["root_hash"]
 
 
 def _write_root_file(doc, path):
@@ -275,17 +318,29 @@ def root(date=None, force=False, conn=None, publish_github=True):
     from . import x402watch, x402trust, witness
     conn.executescript(x402watch.SCHEMA_SQL)
     x402trust._migrate(conn)
-    conn.executescript(SCHEMA_SQL)
-    _migrate_leaves(conn)
+    _init(conn)
     conn.executescript(witness.SCHEMA_SQL)
     date = date or _today_utc()
 
     existing = conn.execute("SELECT * FROM daily_roots WHERE date=?", (date,)).fetchone()
-    if existing is not None and not force:
-        out = _public_doc(existing)
+    published = is_published(date)
+    # 制約7: 既に公開済みの日付rootは、--forceなしでは再生成不可(DB行が無くても保護)
+    if (existing is not None or published) and not force:
+        if existing is not None:
+            out = _public_doc(existing)
+        else:                              # 公開済みだがDBに行が無い(genesis checkpoint等)
+            out = {"date": date, "root_hash": published_root_hash(date),
+                   "note": "already published; not regenerating"}
         if own:
             conn.close()
         return out
+    # 制約7: 本番では公開済み日付への --force を禁止(暴発防止)
+    if force and published and os.environ.get("KKJ_ATTEST_ALLOW_FORCE") != "1":
+        if own:
+            conn.close()
+        raise RuntimeError(
+            f"refusing to --force regenerate an already-published root for {date}. "
+            "Published roots are immutable. (dev override: KKJ_ATTEST_ALLOW_FORCE=1)")
 
     # 鍵(なければ生成)
     pub_b64, _ = keygen()
@@ -334,7 +389,8 @@ def root(date=None, force=False, conn=None, publish_github=True):
     conn.execute("DELETE FROM daily_leaves WHERE date=?", (date,))
     conn.execute(
         "INSERT INTO daily_roots(date, chain_index, previous_root, records_count, merkle_root,"
-        " root_hash, algo, public_key, signature, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        " root_hash, algo, public_key, signature, created_at, leaves_available)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,1)",
         (date, chain_index, previous_root, len(leaves), mroot, root_hash, ALGO,
          pub_b64, signature, created_at))
     conn.executemany(
@@ -395,6 +451,24 @@ def verify_root(date, conn=None):
         if own:
             conn.close()
         return {"ok": False, "error": "root_not_found", "date": date}
+    # genesis checkpoint(葉なし): 署名・root_hash・連結のみ検証(Merkleは葉が無いため対象外)
+    if not _row_get(row, "leaves_available"):
+        signed_doc = {"date": row["date"], "previous_root": row["previous_root"],
+                      "records_count": row["records_count"], "merkle_root": row["merkle_root"],
+                      "created_at": row["created_at"]}
+        rh_ok = sha256_hex(canonical(signed_doc)) == row["root_hash"]
+        sig_ok = verify_signature(row["root_hash"], row["signature"], row["public_key"])
+        chain_ok = (row["previous_root"] is None) if row["chain_index"] == 0 else True
+        out = {"ok": bool(rh_ok and sig_ok), "checkpoint": True, "date": date,
+               "chain_index": row["chain_index"],
+               "checks": {"root_hash": rh_ok, "signature": sig_ok, "chain_link": chain_ok,
+                          "merkle": "n/a (public genesis checkpoint; leaves not retained)"},
+               "root_hash": row["root_hash"], "public_key": row["public_key"],
+               "note": "Public genesis checkpoint. Later roots are hash-chained from this "
+                       "root_hash; individual leaf proofs are available from the next root onward."}
+        if own:
+            conn.close()
+        return out
     # 1) Merkle再計算(保存された葉から)
     leaf_hashes = [r["leaf_hash"] for r in conn.execute(
         "SELECT leaf_hash FROM daily_leaves WHERE date=? ORDER BY leaf_index", (date,)).fetchall()]
@@ -431,6 +505,16 @@ def verify_root(date, conn=None):
     return out
 
 
+def _checkpoint_response(date):
+    return {
+        "ok": False, "status": "checkpoint", "date": date,
+        "note": "This date is a public genesis checkpoint: its individual leaves are not "
+                "retained, so per-item proofs are unavailable. Later roots remain "
+                "hash-chained from this checkpoint's root_hash (previous_root), so proofs "
+                "issued from the next root onward are anchored to the public checkpoint.",
+    }
+
+
 def prove_resource(resource_id, date, conn=None):
     own = conn is None
     if own:
@@ -441,6 +525,10 @@ def prove_resource(resource_id, date, conn=None):
         if own:
             conn.close()
         return {"ok": False, "error": "root_not_found", "date": date}
+    if not _row_get(row, "leaves_available"):
+        if own:
+            conn.close()
+        return _checkpoint_response(date)
     leaves = conn.execute(
         "SELECT leaf_index, resource_id, leaf_hash, record_json FROM daily_leaves "
         "WHERE date=? ORDER BY leaf_index", (date,)).fetchall()
@@ -496,6 +584,10 @@ def prove_anchor(sha256, conn=None):
                 "note": "Accepted. Will be included in the next daily signed root (~23:55 UTC)."}
     date = a["root_date"]
     row = conn.execute("SELECT * FROM daily_roots WHERE date=?", (date,)).fetchone()
+    if row is not None and not _row_get(row, "leaves_available"):
+        if own:
+            conn.close()
+        return _checkpoint_response(date)
     leaves = conn.execute(
         "SELECT leaf_index, leaf_hash, record_json, leaf_type, ref FROM daily_leaves "
         "WHERE date=? ORDER BY leaf_index", (date,)).fetchall()

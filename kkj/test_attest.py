@@ -3,7 +3,10 @@
   python -m kkj.test_attest
 """
 import json
+import os
 import tempfile
+
+os.environ["KKJ_ATTEST_ALLOW_FORCE"] = "1"   # devテストでは公開済みrootの--force再生成を許可
 
 _tmp = tempfile.mkdtemp()
 from . import config

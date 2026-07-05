@@ -83,6 +83,8 @@ python -m kkj.attest prove-resource 42 2026-07-05  # 1リソースのinclusion p
 - 無料: `GET /x402/attestations`(最新root+検証手順)、`GET /x402/trust/{id}` に `latest_attestation_available`
 - 有料(x402): `GET /paid/x402/attest/{id}` $0.02 — 観測記録・trust score・inclusion proof・daily root・署名・検証手順（第三者に見せられる改竄不能な証拠）
 
+**Published roots are immutable.** 公開した `roots/YYYY-MM-DD.root.json` は絶対に差し替えません。早期チェックポイントの個別proofが取得不能な場合でも、以降のrootはその公開チェックポイントの `root_hash` から `previous_root` でハッシュ連鎖され続けます（later roots remain hash-chained from the public checkpoint）。本番で `--force` による公開日付rootの再生成は禁止（`KKJ_ATTEST_ALLOW_FORCE=1` はdev専用の明示override）。proofは公開rootとDB rootが整合する日付に対してのみ発行します。
+
 **🌐 公開サービス: https://5.75.142.199.sslip.io/ (無料ティア 200リクエスト/日)**
 
 ```json

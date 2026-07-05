@@ -1528,10 +1528,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         out = attest.prove_anchor(norm, conn=conn)
         base = self._base_url()
-        if out.get("ok") or out.get("status") == "pending":
+        # 制約6: 公開rootとDB rootが整合する日付のproofのみ返す
+        if out.get("ok") and not attest.is_proof_available(conn, out.get("date")):
+            out = {"ok": False, "status": "pending_publication", "sha256": norm,
+                   "note": "Committed, but its signed root is not yet publicly consistent. "
+                           "The proof will be available once the root is published."}
+        if out.get("ok") or out.get("status") in ("pending", "pending_publication", "checkpoint"):
             out.setdefault("verify_url", f"{base}/witness/proof/{norm}")
             out.setdefault("cli_verify", f"python -m kkj.attest prove-hash {norm}")
-        status = 200 if (out.get("ok") or out.get("status") == "pending") else 404
+        status = 200 if (out.get("ok") or out.get("status") in
+                         ("pending", "pending_publication", "checkpoint")) else 404
         self._json(out, status)
 
     def _witness_anchor(self, conn, body, client):
@@ -1651,6 +1657,12 @@ class Handler(BaseHTTPRequestHandler):
         if lr is None:
             self._json({"error": "no_attestation_yet",
                         "hint": "No daily signed root has been generated yet. No charge."}, 409)
+            return
+        # 制約6: 公開rootとDB rootが整合する日付のみ証明を発行(不整合なら課金しない)
+        if not attest.is_proof_available(conn, lr["date"]):
+            self._json({"error": "root_not_publicly_consistent",
+                        "hint": "The latest signed root is not yet publicly consistent. "
+                                "No charge. Try again shortly.", "date": lr["date"]}, 409)
             return
         in_root = conn.execute(
             "SELECT 1 FROM daily_leaves WHERE date=? AND resource_id=?",
