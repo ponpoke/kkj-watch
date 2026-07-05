@@ -1,7 +1,19 @@
-# kkj-watch — 入札案件の変更検知・要件構造化エンジン
+# kkj-watch — 変更検知エンジン(x402レジストリ+官公需入札)
 
-> **Free machine-readable feed for Japanese procurement changes. Paid endpoints provide cached structured requirements and on-demand extraction.**
-> Free: `/events` (filter `?tag=`), `/cases?query=`, `/sample-diff`, `/agent.json`. Paid (x402): `/paid/requirements/{key}` ($0.02, cached), `/paid/analyze-now/{key}` ($0.30, fresh LLM).
+> **Change detection for machines — two free feeds + x402-paid evidence.**
+> 1. **x402 registry watch**: every change in the x402 Bazaar registry (23k+ resources) — `price_changed`, `payto_changed` (receiving-address change: verify before paying), `schema_changed`, listings/delistings. Free: `/x402/changes` (filter `?type=`), `/x402/resources?q=`, `/x402/sample-change`. Paid: `/paid/x402/history/{id}` ($0.01, full SHA-256 audit trail).
+> 2. **Japanese procurement watch**: corrections, deadline changes, document replacements. Free: `/events` (filter `?tag=`), `/cases?query=`, `/sample-diff`, `/agent.json`. Paid (x402): `/paid/requirements/{key}` ($0.02, cached), `/paid/analyze-now/{key}` ($0.30, fresh LLM).
+
+## x402レジストリ変更検知(第2プロダクト)
+
+x402エコシステムのBazaarレジストリ(公開discovery API)を毎時同期し、掲載リソースの**価格・受取アドレス(payTo)・スキーマ・掲載状態**の変化を検知する。エージェントが「支払う直前に、キャッシュ済みの支払い条件が変わっていないか」を$0以下のコストで確認できるレイヤー。
+
+安全設計: 監視対象は**レジストリの掲載内容のみ**。掲載されている23k超の外部エンドポイントには一切アクセスしない(SSRF・迷惑クロール・任意URL登録のリスクを構造的に排除)。通信先は `api.cdp.coinbase.com` 固定。
+
+```sh
+python -m kkj.x402watch sync    # レジストリ同期(systemdタイマーで毎時)
+python -m kkj.x402watch stats   # 蓄積状況
+```
 
 **🌐 公開サービス: https://5.75.142.199.sslip.io/ (無料ティア 200リクエスト/日)**
 

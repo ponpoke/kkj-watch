@@ -1,0 +1,9 @@
+[Unit]
+Description=kkj-watch x402 Bazaar registry sync (change detection, no external probing)
+
+[Service]
+Type=oneshot
+User=kkj
+WorkingDirectory=/opt/kkj-watch
+EnvironmentFile=/etc/kkj-watch.env
+ExecStart=/usr/bin/python3 -m kkj.x402watch sync

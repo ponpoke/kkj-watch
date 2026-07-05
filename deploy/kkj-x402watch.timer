@@ -1,0 +1,10 @@
+[Unit]
+Description=Run x402 Bazaar registry sync hourly
+
+[Timer]
+OnCalendar=*-*-* *:40:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

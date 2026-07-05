@@ -14,6 +14,25 @@ PROTOCOL_VERSION = "2025-06-18"
 
 TOOLS = [
     {
+        "name": "list_x402_registry_changes",
+        "description": "List recent change events in the x402 Bazaar registry (23k+ paid API "
+                       "resources): price_changed, payto_changed (receiving-address change — verify "
+                       "before paying), accepts_changed, schema_changed, delisted/relisted. Free. "
+                       "Hourly polling with SHA-256 snapshot audit trail. Use before paying a "
+                       "cached x402 endpoint to confirm its terms did not change.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string",
+                         "description": "event type filter (price_changed / payto_changed / "
+                                        "accepts_changed / schema_changed / delisted / relisted)"},
+                "severity": {"type": "string",
+                             "description": "severity filter (critical / high / medium / low)"},
+                "limit": {"type": "integer", "description": "max items (default 20)"},
+            },
+        },
+    },
+    {
         "name": "list_japan_procurement_changes",
         "description": "List recent change events in Japanese public procurement (government tenders): "
                        "corrections, deadline changes, requirement changes, document replacements. "
@@ -158,6 +177,37 @@ def tool_list_change_events(args):
     return out
 
 
+def tool_list_x402_changes(args):
+    """x402 Bazaarレジストリの変更イベント一覧(無料・ルールベース検知)"""
+    from . import x402watch
+    limit = min(int(args.get("limit", 20)), 100)
+    etype = args.get("type") or ""
+    severity = args.get("severity") or ""
+    conn = store.connect()
+    conn.executescript(x402watch.SCHEMA_SQL)
+    where, params = [], []
+    if etype:
+        where.append("e.event_type=?")
+        params.append(etype)
+    if severity:
+        where.append("e.severity=?")
+        params.append(severity)
+    sql = ("SELECT e.*, r.resource, r.service_name FROM x402_events e"
+           " JOIN x402_resources r ON r.id=e.resource_id")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY e.id DESC LIMIT ?"
+    params.append(limit)
+    out = [{
+        "resource": r["resource"], "service_name": r["service_name"],
+        "event_type": r["event_type"], "severity": r["severity"],
+        "detected_at": r["detected_at"],
+        "detail": json.loads(r["detail_json"]) if r["detail_json"] else None,
+    } for r in conn.execute(sql, params).fetchall()]
+    conn.close()
+    return out
+
+
 def tool_get_requirements(args):
     """キャッシュ済み構造化要件を返す。未抽出は有料オンデマンド解析へ誘導(裏でLLMを呼ばない=コスト制御)"""
     conn = store.connect()
@@ -172,6 +222,7 @@ def tool_get_requirements(args):
 
 HANDLERS = {
     # 目的ベースの新名(外部エージェント向け)
+    "list_x402_registry_changes": tool_list_x402_changes,
     "find_tender_deadline_changes": tool_search_cases,
     "get_tender_change_evidence": tool_get_case,
     "list_japan_procurement_changes": tool_list_change_events,
