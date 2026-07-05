@@ -286,6 +286,14 @@ def usage_stats(conn):
     paid_conv = conn.execute(
         "SELECT COUNT(DISTINCT client) n FROM payment_log WHERE success=1 "
         "AND client NOT IN ('127.0.0.1','::1','5.75.142.199')").fetchone()["n"]
+    # 制約8: マーケ面ごとにアクセスを分けて計測(外部IPのみ・test除外)
+    def surface(prefix):
+        r = conn.execute(
+            "SELECT COUNT(*) hits, COUNT(DISTINCT client) uniq FROM usage_log "
+            "WHERE path LIKE ? AND (usage_class IS NULL OR usage_class!='test') "
+            "AND client NOT IN ('127.0.0.1','::1','5.75.142.199')",
+            (prefix + "%",)).fetchone()
+        return {"hits": r["hits"], "uniq": r["uniq"]}
     return {
         "unique_clients": uniq, "sustained_7d_clients": sustained,
         "gate": "unique>=10 and sustained>=3",
@@ -294,6 +302,13 @@ def usage_stats(conn):
             "free_agent_use": uniq_of("free_agent_use"),
             "paid_intent": uniq_of("paid_intent"),
             "paid_conversion": paid_conv,
+        },
+        "surfaces": {
+            "entity_pages": surface("/x402/e/"),
+            "badges": surface("/badge/"),
+            "claim": surface("/x402/claim/"),
+            "paid_attest": surface("/paid/x402/attest/"),
+            "witness_anchor": surface("/witness/anchor"),
         },
     }
 
@@ -304,6 +319,13 @@ def _row_get(row, col):
         return row[col]
     except (KeyError, IndexError):
         return None
+
+
+def _h(s):
+    """HTMLエスケープ"""
+    return (str(s if s is not None else "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
 
 
 def _svg_badge(label, message, color):
@@ -336,6 +358,117 @@ def _svg_badge(label, message, color):
         f'<text x="{lw + mw/2:.0f}" y="15" fill="#010101" fill-opacity=".3">{msg_e}</text>'
         f'<text x="{lw + mw/2:.0f}" y="14">{msg_e}</text>'
         f'</g></svg>')
+
+
+def _render_x402_entity(base, d, indexable, disclaimer):
+    """resource固有の観測情報を必ず含む公開リファレンスページ(誇張表現なし)"""
+    canonical = f"{base}/x402/e/{d['id']}"
+    resource = d["resource"]
+    name = d["service_name"] or d["host"] or resource
+    score = d["trust_score"]
+    grade = d["grade"] or "unrated"
+    v = d["verdicts"]
+    robots = "index,follow" if indexable else "noindex,follow"
+    payto_status = ("live payTo differs from registry" if v.get("payto_risk") == "live_mismatch"
+                    else "changed recently" if v.get("payto_risk") == "changed_recently"
+                    else "stable (as observed)")
+    # JSON-LD: 観測値をPropertyValueで。endorsement/aggregateRatingは使わない(誇張回避)
+    ld = {
+        "@context": "https://schema.org", "@type": "WebPage",
+        "name": f"Observed x402 trust record — {name}",
+        "url": canonical, "dateModified": d["last_seen"],
+        "about": {"@type": "WebAPI", "name": name, "url": resource},
+        "mainEntity": {
+            "@type": "Dataset",
+            "name": f"Observed trust record for {resource}",
+            "description": "Observation-based, evidence-based risk indicator for an x402 "
+                           "endpoint (payTo/price consistency, liveness, listing history). "
+                           "Not a safety guarantee.",
+            "creator": {"@type": "Organization", "name": "kkj-watch"},
+            "variableMeasured": [
+                {"@type": "PropertyValue", "name": "observed_trust_score",
+                 "value": score, "maxValue": 100, "minValue": 0},
+                {"@type": "PropertyValue", "name": "grade", "value": grade},
+                {"@type": "PropertyValue", "name": "payto_status", "value": payto_status},
+                {"@type": "PropertyValue", "name": "verified_live",
+                 "value": str(v.get("verified_live"))},
+                {"@type": "PropertyValue", "name": "attested",
+                 "value": str(d["attested"])},
+            ],
+        },
+    }
+    def rows_html(items):
+        return "".join(items)
+    price_rows = rows_html([
+        f"<tr><td>{_h(p['network'])}</td><td>{_h(p['amount'])}</td>"
+        f"<td>{('$'+format(p['usd'],'g')) if p['usd'] is not None else '-'}</td>"
+        f"<td><code>{_h((p['payTo'] or '')[:14])}…</code></td></tr>"
+        for p in d["prices"]]) or "<tr><td colspan=4>-</td></tr>"
+    event_rows = rows_html([
+        f"<tr><td>{_h(e['detected_at'][:19])}</td><td>{_h(e['event_type'])}</td>"
+        f"<td>{_h(e['severity'])}</td></tr>" for e in d["events"][:10]]) \
+        or "<tr><td colspan=3>no change events observed yet</td></tr>"
+    probe_rows = rows_html([
+        f"<tr><td>{_h(p['probed_at'][:19])}</td><td>{'alive' if p['alive'] else 'unreachable'}</td>"
+        f"<td>{'402' if p['is_402'] else '-'}</td><td>{_h(p['consistency'])}</td></tr>"
+        for p in d["probes"]]) or "<tr><td colspan=4>not probed yet</td></tr>"
+    reasons = "".join(f"<li>{_h(r)}</li>" for r in d["reasons"][:8]) or "<li>-</li>"
+    attest_line = (
+        f'Committed to signed daily root <code>{_h((d["attestation_root"] or "")[:16])}…</code> '
+        f'({_h(d["attestation_date"])}). '
+        f'<a href="{base}/paid/x402/attest/{d["id"]}">signed inclusion proof ($0.02)</a> · '
+        f'<a href="{base}/x402/attestations">roots</a>'
+        if d["attested"] else
+        f'Not yet in a signed root. <a href="{base}/x402/attestations">how roots work</a>')
+    badge_md = (f"[![x402 trust]({base}/badge/x402/{d['id']}.svg)]"
+                f"({base}/x402/trust/{d['id']})")
+    guard_py = (f'from x402guard import safe_pay\n'
+                f'data = safe_pay("{resource}", pay=lambda: my_x402_client.get(url))')
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="{robots}">
+<link rel="canonical" href="{_h(canonical)}">
+<title>x402 observed trust: {_h(name)} — kkj-watch</title>
+<meta name="description" content="Observed, evidence-based risk indicator for the x402 endpoint {_h(resource)}: payTo/price consistency, liveness, listing history. Not a safety guarantee.">
+<script type="application/ld+json">{json.dumps(ld, ensure_ascii=False)}</script>
+<style>body{{font-family:system-ui,sans-serif;max-width:820px;margin:2rem auto;padding:0 1rem;line-height:1.6;color:#222}}
+h1{{font-size:1.3rem}} h2{{font-size:1.05rem;margin-top:1.6rem;border-left:4px solid #0a6;padding-left:.5rem}}
+table{{border-collapse:collapse;width:100%;font-size:.9rem}} td,th{{border:1px solid #ddd;padding:.3rem .5rem;text-align:left}}
+code,pre{{background:#f4f4f4;border-radius:4px;padding:.1rem .3rem;font-size:.85em}} pre{{padding:.7rem;overflow-x:auto}}
+.score{{font-size:1.6rem;font-weight:bold}} .warn{{color:#c0392b}} .muted{{color:#888;font-size:.85rem}}</style>
+</head><body>
+<h1>x402 observed trust — {_h(name)}</h1>
+<p class="muted">Endpoint: <code>{_h(resource)}</code></p>
+<p><span class="score">{_h(grade)}</span> · observed trust score <strong>{_h(score if score is not None else 'unrated')}</strong>/100
+{'<span class="warn"> · live payTo mismatch</span>' if v.get('payto_risk')=='live_mismatch' else ''}</p>
+<p class="muted">This is an <strong>observed, evidence-based risk indicator — not a safety guarantee</strong>.
+{_h(disclaimer)}</p>
+<h2>Observed verdicts</h2>
+<table><tr><th>verified live (402)</th><td>{_h(v.get('verified_live'))}</td></tr>
+<tr><th>listing vs live</th><td>{_h(v.get('listing_matches_live'))}</td></tr>
+<tr><th>payTo</th><td>{_h(payto_status)}</td></tr>
+<tr><th>spam-farm payTo</th><td>{_h(v.get('farm_member'))}</td></tr>
+<tr><th>active listing</th><td>{_h(v.get('active_listing'))}</td></tr>
+<tr><th>first observed</th><td>{_h((d['first_seen'] or '')[:10])}</td></tr>
+<tr><th>snapshots</th><td>{d['snapshot_count']}</td></tr></table>
+<h3 class="muted">Why this score</h3><ul class="muted">{reasons}</ul>
+<h2>Payment terms (registry)</h2>
+<table><tr><th>network</th><th>amount</th><th>USD</th><th>payTo</th></tr>{price_rows}</table>
+<h2>Change events observed</h2>
+<table><tr><th>at</th><th>event</th><th>severity</th></tr>{event_rows}</table>
+<h2>Live probes (GET-only, never pays)</h2>
+<table><tr><th>at</th><th>reachability</th><th>402</th><th>listing vs live</th></tr>{probe_rows}</table>
+<h2>Signed evidence</h2><p>{attest_line}</p>
+<h2>Machine access</h2>
+<p><a href="{base}/x402/trust/{d['id']}">JSON trust</a> ·
+<a href="{base}/x402/trust-feed.json">trust feed</a> ·
+<a href="{base}/x402/claim/{d['id']}">claim this badge</a></p>
+<h2>Sellers: display it</h2><pre>{_h(badge_md)}</pre>
+<h2>Buyers: check before you pay (x402guard)</h2><pre>{_h(guard_py)}</pre>
+<footer class="muted"><hr>Observed by <a href="{base}/">kkj-watch</a> — x402 registry change detection &amp;
+observed trust, backed by daily Ed25519-signed hash-chain roots. Risk indicator, not a guarantee.
+Verify payment terms yourself before paying.</footer>
+</body></html>"""
 
 
 def case_summary(row):
@@ -478,6 +611,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._witness_info(conn)
             elif path.startswith("/witness/proof/"):
                 self._witness_proof(conn, path)
+            elif path.startswith("/x402/e/"):
+                self._x402_entity_page(conn, path)
+            elif path == "/sitemap-x402.xml":
+                self._sitemap_x402(conn)
             elif path in ("/agent.json", "/agents"):
                 self._agent_json(conn)
             elif path.startswith("/paid/requirements/"):
@@ -488,7 +625,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._paid_job(conn, path)
             elif path == "/robots.txt":
                 base = self._base_url()
-                body = (f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n"
+                body = (f"User-agent: *\nAllow: /\n"
+                        f"Sitemap: {base}/sitemap.xml\nSitemap: {base}/sitemap-x402.xml\n"
                         f"# AI agents: {base}/llms.txt and {base}/.well-known/x402.json\n").encode()
                 self._raw(body, "text/plain; charset=utf-8")
             elif path in ("/.well-known/x402", "/.well-known/x402.json"):
@@ -758,6 +896,7 @@ class Handler(BaseHTTPRequestHandler):
                 "prices": prices,
                 "first_seen": r["first_seen"], "last_seen": r["last_seen"],
                 "events": f"{base}/x402/changes",
+                "page_url": f"{base}/x402/e/{r['id']}",
                 "trust_url": f"{base}/x402/trust/{r['id']}",
                 "badge_url": f"{base}/badge/x402/{r['id']}.svg",
                 "claim_badge": f"{base}/x402/claim/{r['id']}",
@@ -1062,6 +1201,115 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    # ---- プログラマティックGEO: resource毎の公開リファレンスページ ----
+
+    def _x402_entity_data(self, conn, row):
+        """1 resourceの観測情報一式(ページ生成用)。全て実観測データ。"""
+        from . import x402watch, x402trust, attest
+        rid = row["id"]
+        rec = json.loads(row["latest_json"])
+        trust = json.loads(row["trust_json"]) if _row_get(row, "trust_json") else {}
+        prices = []
+        for a in rec.get("accepts", []):
+            usd = x402watch.usd_of(a.get("amount"), a.get("asset"))
+            prices.append({"network": a.get("network"), "amount": a.get("amount"),
+                           "asset": a.get("asset"), "payTo": a.get("payTo"),
+                           "usd": usd})
+        events = [{"event_type": e["event_type"], "severity": e["severity"],
+                   "detected_at": e["detected_at"],
+                   "detail": json.loads(e["detail_json"]) if e["detail_json"] else None}
+                  for e in conn.execute(
+                      "SELECT * FROM x402_events WHERE resource_id=? ORDER BY id DESC LIMIT 20",
+                      (rid,)).fetchall()]
+        probes = []
+        try:
+            probes = [{"probed_at": p["probed_at"], "alive": bool(p["alive"]),
+                       "is_402": bool(p["is_402"]), "consistency": p["consistency"]}
+                      for p in conn.execute(
+                          "SELECT * FROM x402_probes WHERE resource_id=? ORDER BY id DESC LIMIT 5",
+                          (rid,)).fetchall()]
+        except Exception:
+            probes = []
+        snap_count = conn.execute(
+            "SELECT COUNT(*) n FROM x402_snapshots WHERE resource_id=?", (rid,)).fetchone()["n"]
+        attested, root_hash, root_date = False, None, None
+        try:
+            lr = attest.latest_root(conn)
+            if lr is not None and conn.execute(
+                    "SELECT 1 FROM daily_leaves WHERE date=? AND resource_id=?",
+                    (lr["date"], rid)).fetchone() is not None:
+                attested, root_hash, root_date = True, lr["root_hash"], lr["date"]
+        except Exception:
+            pass
+        return {
+            "id": rid, "resource": row["resource"], "service_name": row["service_name"],
+            "host": urllib.parse.urlsplit(row["resource"]).hostname or "",
+            "active": bool(row["active"]),
+            "first_seen": row["first_seen"], "last_seen": row["last_seen"],
+            "trust_score": _row_get(row, "trust_score"),
+            "grade": trust.get("grade"), "verdicts": trust.get("verdicts", {}) or {},
+            "reasons": trust.get("reasons", []),
+            "last_verified_at": trust.get("last_verified_at"),
+            "prices": prices, "events": events, "probes": probes,
+            "snapshot_count": snap_count, "probe_count": len(probes),
+            "attested": attested, "attestation_root": root_hash, "attestation_date": root_date,
+        }
+
+    def _x402_indexable(self, d):
+        """sitemap/インデックス対象か。制約3をベースに、attestationは全件一括で品質信号に
+        ならないため「trust_scoreあり かつ 実プローブ済み(実観測)」を必須にして質を担保。
+        (未プローブ=registry計算のみのページはnoindex・sitemap非掲載)"""
+        return d.get("trust_score") is not None and d.get("probe_count", 0) > 0
+
+    def _x402_entity_page(self, conn, path):
+        from . import x402watch, x402trust
+        conn.executescript(x402watch.SCHEMA_SQL)
+        x402trust._migrate(conn)
+        ident = urllib.parse.unquote(path[len("/x402/e/"):])
+        row = self._x402_find(conn, ident)
+        base = self._base_url()
+        if row is None:
+            body = (b"<!doctype html><meta name='robots' content='noindex'>"
+                    b"<title>Not found</title><p>Unknown x402 resource.</p>")
+            self._raw(body, "text/html; charset=utf-8", 404)
+            return
+        d = self._x402_entity_data(conn, row)
+        indexable = self._x402_indexable(d)
+        html = _render_x402_entity(base, d, indexable, x402trust.SCORE_DISCLAIMER)
+        self._raw_cached(html.encode("utf-8"), "text/html; charset=utf-8", 1800)
+
+    def _sitemap_x402(self, conn):
+        """制約: trust_scoreあり かつ (プローブ済み or attestationあり) のみ掲載"""
+        from . import x402watch, x402trust, attest
+        conn.executescript(x402watch.SCHEMA_SQL)
+        x402trust._migrate(conn)
+        base = self._base_url()
+        try:
+            lr = attest.latest_root(conn)
+            attested_date = lr["date"] if lr else None
+        except Exception:
+            attested_date = None
+        rows = conn.execute(
+            """SELECT r.id, r.last_seen,
+                      (SELECT COUNT(*) FROM x402_probes p WHERE p.resource_id=r.id) AS pc
+               FROM x402_resources r
+               WHERE r.active=1 AND r.trust_score IS NOT NULL
+               ORDER BY r.trust_score DESC, r.id ASC LIMIT 5000""").fetchall()
+        _ = attested_date
+        urls = []
+        for r in rows:
+            if (r["pc"] or 0) <= 0:
+                continue                      # 実プローブ済みのみ掲載(制約3/6)
+            lastmod = (r["last_seen"] or "")[:10]
+            urls.append(
+                f"<url><loc>{base}/x402/e/{r['id']}</loc>"
+                + (f"<lastmod>{lastmod}</lastmod>" if lastmod else "")
+                + "<changefreq>daily</changefreq></url>")
+        body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+                + "\n".join(urls) + "\n</urlset>\n").encode("utf-8")
+        self._raw_cached(body, "application/xml; charset=utf-8", 3600)
 
     # ---- verifiedバッジ(#3: 売り手に自分でTrustを宣伝してもらう) ----
 
@@ -2088,7 +2336,8 @@ a{{color:#0a6}}</style></head><body>
 
     # 公開埋め込み(バッジ・feed・claim)は無償ティア上限の対象外。README等に貼られた
     # バッジがGitHub camo経由で集中アクセスされても壊れないようにする
-    _NO_LIMIT_PREFIXES = ("/badge/", "/x402/trust-feed", "/x402/claim", "/witness")
+    _NO_LIMIT_PREFIXES = ("/badge/", "/x402/trust-feed", "/x402/claim", "/witness",
+                          "/x402/e/", "/sitemap")
 
     def _identify(self, conn, path=""):
         """APIキー検証+無償ティアの日次上限。戻り値: (client識別子, エラー or None)"""

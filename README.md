@@ -4,6 +4,15 @@
 > 1. **x402 registry watch**: every change in the x402 Bazaar registry (23k+ resources) — `price_changed`, `payto_changed` (receiving-address change: verify before paying), `schema_changed`, listings/delistings. Free: `/x402/changes` (filter `?type=`), `/x402/resources?q=`, `/x402/sample-change`. Paid: `/paid/x402/history/{id}` ($0.01, full SHA-256 audit trail).
 > 2. **Japanese procurement watch**: corrections, deadline changes, document replacements. Free: `/events` (filter `?tag=`), `/cases?query=`, `/sample-diff`, `/agent.json`. Paid (x402): `/paid/requirements/{key}` ($0.02, cached), `/paid/analyze-now/{key}` ($0.30, fresh LLM).
 
+## プログラマティックGEO: resource毎の公開リファレンスページ
+
+`GET /x402/e/{id}` = 監視中x402エンドポイント1件ごとの公開ページ。検索エンジン/LLMに取り込まれ「is this x402 endpoint OK to pay?」の答えになる情報surfaceを、営業ゼロ・限界費用ゼロで所有する狙い。各ページはresource固有の実観測(観測verdict・価格・payTo/価格変更履歴・GETプローブ結果・スナップショット数・署名アテステーション状況)を必ず含み、JSON-LD・canonical・バッジ/ x402guardスニペット・trust-feed/attestationリンクを備える。
+
+品質・安全の制約:
+- `sitemap-x402.xml` に載せるのは **trust_scoreあり かつ 実プローブ済み** のresourceのみ(全23kは載せない)。未検証は `noindex` かつ sitemap非掲載。
+- 表現は一貫して **observed trust / risk indicator / not a guarantee**。「safe」とは書かない。
+- `/stats` の `usage.surfaces` で `/x402/e/` `/badge/` `/x402/claim/` `/paid/x402/attest/` `/witness/anchor` へのアクセスを面ごとに分けて計測。
+
 ## Signed existence proof(cryptographic timestamp witness)
 
 任意データの「時刻Tに存在した」を、**中身を明かさずに**証明する層。既存の日次署名ハッシュチェーンに相乗り。**受け取るのはsha256(64桁hex)のみ・原文/契約書/ログ/個人情報/秘密情報は一切受け取らず保存しない。** 法的公証ではなく tamper-evident hash-chain anchor。
