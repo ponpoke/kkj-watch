@@ -37,18 +37,30 @@ SEED = [
     {"name": "e-Gov 法令API(法令一覧)", "provider": "デジタル庁 (e-Gov)", "category": "legal",
      "url": "https://laws.e-gov.go.jp/api/1/lawlists/1",
      "docs": "https://laws.e-gov.go.jp/apitop/", "auth_required": False},
-    {"name": "data.go.jp CKAN(データセット一覧)", "provider": "デジタル庁", "category": "opendata",
-     "url": "https://www.data.go.jp/data/api/3/action/package_list",
-     "docs": "https://www.data.go.jp/", "auth_required": False},
     {"name": "e-Stat 統計API(統計表一覧)", "provider": "総務省統計局 (e-Stat)", "category": "statistics",
      "url": "https://api.e-stat.go.jp/rest/3.0/app/json/getStatsList",
      "docs": "https://www.e-stat.go.jp/api/", "auth_required": True},
-    {"name": "RESAS 地域経済API(都道府県一覧)", "provider": "内閣府 (RESAS)", "category": "statistics",
-     "url": "https://opendata.resas-portal.go.jp/api/v1/prefectures",
-     "docs": "https://opendata.resas-portal.go.jp/", "auth_required": True},
     {"name": "官公需情報ポータル 検索API", "provider": "中小企業庁 (kkj)", "category": "procurement",
      "url": "https://www.kkj.go.jp/api/",
      "docs": "https://www.kkj.go.jp/", "auth_required": False},
+    {"name": "気象庁 地震情報一覧", "provider": "気象庁 (JMA)", "category": "weather",
+     "url": "https://www.jma.go.jp/bosai/quake/data/list.json",
+     "docs": "https://www.jma.go.jp/bosai/", "auth_required": False},
+    {"name": "気象庁 気象警報(東京)", "provider": "気象庁 (JMA)", "category": "weather",
+     "url": "https://www.jma.go.jp/bosai/warning/data/warning/130000.json",
+     "docs": "https://www.jma.go.jp/bosai/", "auth_required": False},
+    {"name": "内閣府 祝日API (holidays-jp)", "provider": "holidays-jp", "category": "calendar",
+     "url": "https://holidays-jp.github.io/api/v1/date.json",
+     "docs": "https://holidays-jp.github.io/", "auth_required": False},
+    {"name": "HeartRails Geo 都道府県一覧", "provider": "HeartRails", "category": "geo",
+     "url": "https://geoapi.heartrails.com/api/json?method=getPrefectures",
+     "docs": "https://geoapi.heartrails.com/api.html", "auth_required": False},
+    {"name": "Wikipedia 日本語 API (siteinfo)", "provider": "Wikimedia", "category": "reference",
+     "url": "https://ja.wikipedia.org/w/api.php?action=query&meta=siteinfo&format=json",
+     "docs": "https://www.mediawiki.org/wiki/API:Main_page", "auth_required": False},
+    {"name": "国立国会図書館サーチ OpenSearch", "provider": "国立国会図書館 (NDL)", "category": "reference",
+     "url": "https://ndlsearch.ndl.go.jp/api/opensearch?title=%E5%A4%8F%E7%9B%AE%E6%BC%B1%E7%9F%B3",
+     "docs": "https://ndlsearch.ndl.go.jp/help/api", "auth_required": False},
 ]
 
 SCHEMA_SQL = """
@@ -87,8 +99,13 @@ CREATE INDEX IF NOT EXISTS idx_jp_events_res ON jp_events(resource_id, id);
 DEAD_AFTER = 2
 
 
+def _strip_bom(body: bytes) -> bytes:
+    return body.lstrip(b"\xef\xbb\xbf").lstrip()
+
+
 def _fingerprint(body: bytes, kind: str) -> str:
     """機械可読データの構造指紋。中身の値ではなく『形』のSHA-256(変化検知用)"""
+    body = _strip_bom(body)
     try:
         if kind == "json":
             d = json.loads(body)
@@ -122,13 +139,10 @@ def _json_shape(d, depth=0):
 
 def _classify_body(content_type: str, body: bytes) -> str:
     ct = (content_type or "").lower()
-    head = body[:512].lstrip()
+    head = _strip_bom(body[:512])
+    # 先頭で判定(大きな応答は切り詰められ full parse できないため head を信頼)
     if "json" in ct or head[:1] in (b"{", b"["):
-        try:
-            json.loads(body)
-            return "json"
-        except Exception:
-            pass
+        return "json"
     if "xml" in ct or head[:5] == b"<?xml" or head[:1] == b"<" and b"html" not in head[:120].lower():
         return "xml"
     if "csv" in ct:
@@ -170,6 +184,13 @@ def sync(conn=None, fetch=None):
         conn = store.connect()
     conn.executescript(SCHEMA_SQL)
     ts = store.now_utc()
+    # SEEDから外れたresourceを掃除(curatedリスト=SEEDが正)
+    seed_urls = {s["url"] for s in SEED}
+    for r in conn.execute("SELECT id, url FROM jp_resources").fetchall():
+        if r["url"] not in seed_urls:
+            conn.execute("DELETE FROM jp_probes WHERE resource_id=?", (r["id"],))
+            conn.execute("DELETE FROM jp_events WHERE resource_id=?", (r["id"],))
+            conn.execute("DELETE FROM jp_resources WHERE id=?", (r["id"],))
     # seedを登録(冪等)
     for s in SEED:
         r = conn.execute("SELECT id FROM jp_resources WHERE url=?", (s["url"],)).fetchone()

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "x402guard"
+version = "0.1.0"
+description = "Check an x402 endpoint's observed trust (payTo/price consistency, liveness, spam-farm) before you pay it — one line, zero dependencies."
+readme = "x402guard/README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "ponpoke" }]
+keywords = ["x402", "ai-agents", "agentic-payments", "trust", "safety", "usdc", "base", "mcp"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ponpoke/kkj-watch"
+Source = "https://github.com/ponpoke/kkj-watch/tree/main/x402guard"
+"Trust Index" = "https://5.75.142.199.sslip.io/x402/leaderboard"
+
+[project.scripts]
+x402guard = "x402guard.guard:_cli"
+
+[tool.setuptools]
+packages = ["x402guard"]
