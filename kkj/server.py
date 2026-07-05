@@ -658,12 +658,13 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 try:
-                    from . import x402watch, x402probe, attest, witness, jpdir
+                    from . import x402watch, x402probe, attest, witness, jpdir, discovery
                     out["x402_registry"] = x402watch.stats(conn)
                     out["x402_probes"] = x402probe.stats(conn)
                     out["attestations"] = attest.stats(conn)
                     out["existence_proofs"] = witness.stats(conn)
                     out["jp_directory"] = jpdir.stats(conn)
+                    out["discovery_kpi"] = discovery.report(conn)
                 except Exception:
                     pass
                 self._json(out)
