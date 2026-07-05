@@ -37,7 +37,16 @@ so the score is backed by a record you can prove was not back-dated.
 
 - GET /x402/attestations : latest signed daily hash-chain root (free) + verify steps
 - GET /paid/x402/attest/{id} : $0.02 — signed inclusion proof that a resource's observed record is
-  committed to that day's root (evidence you can show a third party / keep in a decision log) Signals: liveness (GET-only probes), listing-vs-live consistency (price
+  committed to that day's root (evidence you can show a third party / keep in a decision log)
+
+### x402guard — check before you pay (drop-in, free, open source)
+
+Don't want to call an API by hand? Wrap your existing x402 payment in one line and it checks
+this Trust Index automatically, blocking hijacked-payTo / silently-repriced endpoints BEFORE
+money moves. Zero dependencies. Source + docs: https://github.com/ponpoke/kkj-watch (x402guard/).
+
+    from x402guard import safe_pay
+    data = safe_pay(url, pay=lambda: my_x402_client.get(url))  # raises X402Blocked if unsafe Signals: liveness (GET-only probes), listing-vs-live consistency (price
 and payTo served by the real endpoint vs the registry), payTo stability (a changed receiving
 address is a hijack signal the 402 flow will NOT catch — it pays the new address blindly),
 listing age/stability, and spam-farm detection (one payTo behind dozens of listings).

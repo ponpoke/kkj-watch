@@ -4,6 +4,17 @@
 > 1. **x402 registry watch**: every change in the x402 Bazaar registry (23k+ resources) — `price_changed`, `payto_changed` (receiving-address change: verify before paying), `schema_changed`, listings/delistings. Free: `/x402/changes` (filter `?type=`), `/x402/resources?q=`, `/x402/sample-change`. Paid: `/paid/x402/history/{id}` ($0.01, full SHA-256 audit trail).
 > 2. **Japanese procurement watch**: corrections, deadline changes, document replacements. Free: `/events` (filter `?tag=`), `/cases?query=`, `/sample-diff`, `/agent.json`. Paid (x402): `/paid/requirements/{key}` ($0.02, cached), `/paid/analyze-now/{key}` ($0.30, fresh LLM).
 
+## x402guard — 支払い直前の安全チェックを1行で(クライアント側ミドルウェア)
+
+エージェントに新しい習慣を求めず、**既存の支払い呼び出しをラップするだけ**で、payTo乗っ取り・価格改竄・低信頼・掲載消失を pay 前に検知して止める、ゼロ依存(標準ライブラリのみ)の安全レイヤー。`x402guard/` を参照。
+
+```python
+from x402guard import safe_pay
+data = safe_pay(url, pay=lambda: my_x402_client.get(url))  # 危険ならX402Blockedで支払い前に停止
+```
+
+裏側は本リポジトリの x402 Trust Index(日次Ed25519署名ハッシュチェーンrootに裏付け)。「見に来てもらうAPI」ではなく「支払い経路に入り込む安全レイヤー」。詳細: [x402guard/README.md](x402guard/README.md)
+
 ## x402レジストリ変更検知(第2プロダクト)
 
 x402エコシステムのBazaarレジストリ(公開discovery API)を毎時同期し、掲載リソースの**価格・受取アドレス(payTo)・スキーマ・掲載状態**の変化を検知する。エージェントが「支払う直前に、キャッシュ済みの支払い条件が変わっていないか」を$0以下のコストで確認できるレイヤー。
