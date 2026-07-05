@@ -47,13 +47,17 @@ CREATE TABLE IF NOT EXISTS daily_roots (
 CREATE TABLE IF NOT EXISTS daily_leaves (
     date TEXT NOT NULL,
     leaf_index INTEGER NOT NULL,
-    resource_id INTEGER NOT NULL,
+    resource_id INTEGER NOT NULL,      -- resource葉のみ有効(anchor葉は0)
     leaf_hash TEXT NOT NULL,           -- sha256(canonical(record))
     record_json TEXT NOT NULL,         -- ハッシュ+最小メタのみ(原文なし)
+    leaf_type TEXT NOT NULL DEFAULT 'resource',   -- resource / anchor
+    ref TEXT,                          -- resource_id or anchor sha256
     PRIMARY KEY (date, leaf_index)
 );
 CREATE INDEX IF NOT EXISTS idx_daily_leaves_res ON daily_leaves(date, resource_id);
 """
+# 注: leaf_type/ref のインデックスは _migrate_leaves で列追加後に作成する
+# (旧DBに列が無い状態でインデックスを張ろうとすると失敗するため)
 
 
 # ---------- canonical / hash ----------
@@ -235,6 +239,28 @@ def _today_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _migrate_leaves(conn):
+    """既存DBの daily_leaves に leaf_type/ref 列を追加し、列追加後にインデックスを張る"""
+    for sql in ("ALTER TABLE daily_leaves ADD COLUMN leaf_type TEXT NOT NULL DEFAULT 'resource'",
+                "ALTER TABLE daily_leaves ADD COLUMN ref TEXT"):
+        try:
+            conn.execute(sql)
+        except Exception:
+            pass
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_daily_leaves_ref "
+            "ON daily_leaves(date, leaf_type, ref)")
+    except Exception:
+        pass
+
+
+def _init(conn):
+    """attest系テーブルを初期化(スキーマ + 列マイグレーション)"""
+    conn.executescript(SCHEMA_SQL)
+    _migrate_leaves(conn)
+
+
 def _write_root_file(doc, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -246,10 +272,12 @@ def root(date=None, force=False, conn=None, publish_github=True):
     own = conn is None
     if own:
         conn = store.connect()
-    from . import x402watch, x402trust
+    from . import x402watch, x402trust, witness
     conn.executescript(x402watch.SCHEMA_SQL)
     x402trust._migrate(conn)
     conn.executescript(SCHEMA_SQL)
+    _migrate_leaves(conn)
+    conn.executescript(witness.SCHEMA_SQL)
     date = date or _today_utc()
 
     existing = conn.execute("SELECT * FROM daily_roots WHERE date=?", (date,)).fetchone()
@@ -263,14 +291,24 @@ def root(date=None, force=False, conn=None, publish_github=True):
     pub_b64, _ = keygen()
     priv = _load_priv()
 
-    # 葉の構築(resource_id順で決定的)
-    rows = conn.execute("SELECT * FROM x402_resources ORDER BY id").fetchall()
-    leaves, leaf_hashes = [], []
-    for i, r in enumerate(rows):
+    # 葉の構築(1: resource観測をid順、2: 未封入の存在anchorをid順) — 決定的
+    leaves, leaf_hashes = [], []          # 各要素: (index, kind, ref, leaf_hash, record_json)
+    idx = 0
+    for r in conn.execute("SELECT * FROM x402_resources ORDER BY id").fetchall():
         rec = build_resource_leaf(conn, r)
         lh = hash_record(rec)
-        leaves.append((i, r["id"], lh, canonical(rec).decode("utf-8")))
+        leaves.append((idx, "resource", str(r["id"]), lh, canonical(rec).decode("utf-8")))
         leaf_hashes.append(lh)
+        idx += 1
+    pending_anchors = witness.pending(conn)
+    anchor_commits = []                   # (anchor_id, leaf_index)
+    for a in pending_anchors:
+        rec = witness.anchor_record(a)
+        lh = hash_record(rec)
+        leaves.append((idx, "anchor", a["sha256"], lh, canonical(rec).decode("utf-8")))
+        leaf_hashes.append(lh)
+        anchor_commits.append((a["id"], idx))
+        idx += 1
 
     mroot = merkle_root(leaf_hashes)
     prev = conn.execute(
@@ -300,8 +338,12 @@ def root(date=None, force=False, conn=None, publish_github=True):
         (date, chain_index, previous_root, len(leaves), mroot, root_hash, ALGO,
          pub_b64, signature, created_at))
     conn.executemany(
-        "INSERT INTO daily_leaves(date, leaf_index, resource_id, leaf_hash, record_json)"
-        " VALUES (?,?,?,?,?)", [(date, i, rid, lh, rj) for (i, rid, lh, rj) in leaves])
+        "INSERT INTO daily_leaves(date, leaf_index, resource_id, leaf_hash, record_json,"
+        " leaf_type, ref) VALUES (?,?,?,?,?,?,?)",
+        [(date, i, (int(ref) if kind == "resource" else 0), lh, rj, kind, ref)
+         for (i, kind, ref, lh, rj) in leaves])
+    for anchor_id, leaf_index in anchor_commits:      # 存在anchorを封入確定
+        witness.mark_committed(conn, anchor_id, date, leaf_index)
     conn.commit()
 
     row = conn.execute("SELECT * FROM daily_roots WHERE date=?", (date,)).fetchone()
@@ -347,7 +389,7 @@ def verify_root(date, conn=None):
     own = conn is None
     if own:
         conn = store.connect()
-    conn.executescript(SCHEMA_SQL)
+    _init(conn)
     row = conn.execute("SELECT * FROM daily_roots WHERE date=?", (date,)).fetchone()
     if row is None:
         if own:
@@ -393,7 +435,7 @@ def prove_resource(resource_id, date, conn=None):
     own = conn is None
     if own:
         conn = store.connect()
-    conn.executescript(SCHEMA_SQL)
+    _init(conn)
     row = conn.execute("SELECT * FROM daily_roots WHERE date=?", (date,)).fetchone()
     if row is None:
         if own:
@@ -424,6 +466,65 @@ def prove_resource(resource_id, date, conn=None):
         "algo": row["algo"], "public_key": row["public_key"], "signature": row["signature"],
         "verify_steps": [
             "1. leaf_hash == sha256(canonical(record))",
+            "2. fold inclusion_proof over leaf_hash (node=sha256(left||right)) == merkle_root",
+            "3. root_hash == sha256(canonical({date,previous_root,records_count,merkle_root,created_at}))",
+            "4. Ed25519.verify(public_key, signature, utf8(root_hash))",
+        ],
+        "signature_ok": sig_ok,
+    }
+    if own:
+        conn.close()
+    return out
+
+
+def prove_anchor(sha256, conn=None):
+    """存在anchor(sha256)の署名付きinclusion proofを返す。未封入ならpending。"""
+    own = conn is None
+    if own:
+        conn = store.connect()
+    _init(conn)
+    from . import witness
+    a = witness.get(conn, sha256)
+    if a is None:
+        if own:
+            conn.close()
+        return {"ok": False, "error": "not_anchored", "sha256": sha256}
+    if a["status"] != "committed":
+        if own:
+            conn.close()
+        return {"ok": False, "status": "pending", "sha256": sha256,
+                "note": "Accepted. Will be included in the next daily signed root (~23:55 UTC)."}
+    date = a["root_date"]
+    row = conn.execute("SELECT * FROM daily_roots WHERE date=?", (date,)).fetchone()
+    leaves = conn.execute(
+        "SELECT leaf_index, leaf_hash, record_json, leaf_type, ref FROM daily_leaves "
+        "WHERE date=? ORDER BY leaf_index", (date,)).fetchall()
+    leaf_hashes = [l["leaf_hash"] for l in leaves]
+    target = next((l for l in leaves if l["leaf_type"] == "anchor" and l["ref"] == sha256), None)
+    if row is None or target is None:
+        if own:
+            conn.close()
+        return {"ok": False, "error": "root_or_leaf_missing", "sha256": sha256}
+    idx = target["leaf_index"]
+    path = merkle_proof(leaf_hashes, idx)
+    ok = verify_proof(target["leaf_hash"], path, row["merkle_root"])
+    sig_ok = verify_signature(row["root_hash"], row["signature"], row["public_key"])
+    out = {
+        "ok": bool(ok and sig_ok),
+        "kind": "signed_existence_proof",
+        "statement": f"The SHA-256 digest {sha256} existed at or before "
+                     f"{row['created_at']} (committed to our tamper-evident hash chain).",
+        "not_a_notarization": "This is a cryptographic timestamp witness, not a legal "
+                              "notarization. We store only the digest, never the underlying data.",
+        "sha256": sha256, "date": date,
+        "record": json.loads(target["record_json"]),
+        "leaf_hash": target["leaf_hash"], "leaf_index": idx,
+        "inclusion_proof": path,
+        "merkle_root": row["merkle_root"], "root_hash": row["root_hash"],
+        "previous_root": row["previous_root"], "created_at": row["created_at"],
+        "algo": row["algo"], "public_key": row["public_key"], "signature": row["signature"],
+        "verify_steps": [
+            "1. leaf_hash == sha256(canonical(record)); record.sha256 is your digest",
             "2. fold inclusion_proof over leaf_hash (node=sha256(left||right)) == merkle_root",
             "3. root_hash == sha256(canonical({date,previous_root,records_count,merkle_root,created_at}))",
             "4. Ed25519.verify(public_key, signature, utf8(root_hash))",
@@ -474,9 +575,11 @@ def main():
         print(json.dumps(verify_root(args[1]), ensure_ascii=False, indent=1))
     elif cmd == "prove-resource":
         print(json.dumps(prove_resource(args[1], args[2]), ensure_ascii=False, indent=1))
+    elif cmd == "prove-hash":
+        print(json.dumps(prove_anchor(args[1]), ensure_ascii=False, indent=1))
     else:
         print("usage: python -m kkj.attest [keygen|pubkey|root [DATE] [--force]|"
-              "verify-root DATE|prove-resource RID DATE]")
+              "verify-root DATE|prove-resource RID DATE|prove-hash SHA256]")
 
 
 if __name__ == "__main__":

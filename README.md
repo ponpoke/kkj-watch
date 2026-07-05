@@ -4,6 +4,19 @@
 > 1. **x402 registry watch**: every change in the x402 Bazaar registry (23k+ resources) — `price_changed`, `payto_changed` (receiving-address change: verify before paying), `schema_changed`, listings/delistings. Free: `/x402/changes` (filter `?type=`), `/x402/resources?q=`, `/x402/sample-change`. Paid: `/paid/x402/history/{id}` ($0.01, full SHA-256 audit trail).
 > 2. **Japanese procurement watch**: corrections, deadline changes, document replacements. Free: `/events` (filter `?tag=`), `/cases?query=`, `/sample-diff`, `/agent.json`. Paid (x402): `/paid/requirements/{key}` ($0.02, cached), `/paid/analyze-now/{key}` ($0.30, fresh LLM).
 
+## Signed existence proof(cryptographic timestamp witness)
+
+任意データの「時刻Tに存在した」を、**中身を明かさずに**証明する層。既存の日次署名ハッシュチェーンに相乗り。**受け取るのはsha256(64桁hex)のみ・原文/契約書/ログ/個人情報/秘密情報は一切受け取らず保存しない。** 法的公証ではなく tamper-evident hash-chain anchor。
+
+```
+POST /witness/anchor  {"sha256":"<64-hex>"}   # 小さな無料枠/IP・超過はx402 $0.005
+GET  /witness/proof/{sha256}                   # 署名付きMerkle包含証明(未封入はpending)
+GET  /witness                                  # 説明・privacy・料金
+python -m kkj.attest prove-hash <sha256>       # ローカル検証
+```
+
+スパム対策として無料枠は小さく(既定5/日/IP)、超過分はx402有料anchor。x402が廃れても「自分の行為を証明したい」という需要は残るため、Trust Indexの外側へ広げる長期の軸。
+
 ## Trust バッジ(売り手向け・#3) と Trust フィード(発見層向け・#2)
 
 **売り手**は、自分のx402エンドポイントの観測Trustを README/サイトに貼れます(被リンク＝流入):

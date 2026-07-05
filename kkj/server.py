@@ -39,6 +39,18 @@ so the score is backed by a record you can prove was not back-dated.
 - GET /paid/x402/attest/{id} : $0.02 — signed inclusion proof that a resource's observed record is
   committed to that day's root (evidence you can show a third party / keep in a decision log)
 
+### Signed existence proof (cryptographic timestamp witness — NOT legal notarization)
+
+Prove that some data existed at a point in time, WITHOUT revealing it. You hash your data
+yourself (sha256) and submit only the 64-char digest; we commit it into the next daily
+Ed25519-signed hash-chain root and return a signed Merkle inclusion proof.
+
+- We store ONLY your SHA-256 digest. Never send raw data, files, contracts, logs, or secrets.
+- POST /witness/anchor  body {"sha256":"<64-hex>"} : anchor a digest (small free daily quota
+  per IP; over quota -> 402, pay ~$0.005 via x402 and resubmit with X-PAYMENT).
+- GET /witness/proof/{sha256} : signed existence proof (or "pending" until the next daily root).
+- GET /witness : details, privacy, pricing. Verify a proof yourself or with `python -m kkj.attest prove-hash <sha256>`.
+
 ### For catalogs & sellers (free)
 
 - GET /x402/trust-feed.json (also .ndjson) : the whole Trust Index as a feed — ingest it to show
@@ -228,7 +240,7 @@ def classify_usage(path, user_agent, query_has_filter):
     if path.startswith("/paid/"):
         return "paid_intent"
     is_data = (path in _FREE_DATA_PATHS or path.startswith("/cases")
-               or path.startswith("/x402/"))
+               or path.startswith("/x402/") or path.startswith("/witness"))
     if is_data:
         # プローバUAでも、タグ/クエリ付きの具体的な取得は「使っている」と見なす
         if _PROBE_UA.search(ua) and not query_has_filter:
@@ -390,10 +402,11 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 try:
-                    from . import x402watch, x402probe, attest
+                    from . import x402watch, x402probe, attest, witness
                     out["x402_registry"] = x402watch.stats(conn)
                     out["x402_probes"] = x402probe.stats(conn)
                     out["attestations"] = attest.stats(conn)
+                    out["existence_proofs"] = witness.stats(conn)
                 except Exception:
                     pass
                 self._json(out)
@@ -461,6 +474,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._x402_claim(conn, path)
             elif path in ("/x402/trust-feed.json", "/x402/trust-feed.ndjson"):
                 self._x402_trust_feed(conn, "ndjson" if path.endswith(".ndjson") else "json", limit)
+            elif path == "/witness":
+                self._witness_info(conn)
+            elif path.startswith("/witness/proof/"):
+                self._witness_proof(conn, path)
             elif path in ("/agent.json", "/agents"):
                 self._agent_json(conn)
             elif path.startswith("/paid/requirements/"):
@@ -1223,6 +1240,128 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    # ---- signed existence proof / cryptographic timestamp witness ----
+    # 受け取るのは SHA-256 のみ。原文・秘密情報は一切受け取らず保存しない。
+
+    def _witness_info(self, conn):
+        from . import witness, x402_gate
+        base = self._base_url()
+        self._json({
+            "service": "kkj-watch — signed existence proof (cryptographic timestamp witness)",
+            "not_a_notarization": "This is NOT legal notarization. It is a tamper-evident "
+                                  "hash-chain anchor: proof that a SHA-256 digest existed at or "
+                                  "before a signed daily root's timestamp.",
+            "privacy": "We accept and store ONLY a SHA-256 hex digest. Never send raw data, "
+                       "files, contracts, logs, or personal/secret information — hash it yourself "
+                       "first (sha256) and submit only the 64-char digest.",
+            "how": {
+                "submit": f"POST {base}/witness/anchor  body: {{\"sha256\":\"<64-hex>\"}}",
+                "verify": f"GET {base}/witness/proof/{{sha256}}",
+            },
+            "pricing": {
+                "free_per_day_per_ip": witness.FREE_PER_DAY,
+                "paid_anchor_usd": witness.PRICE_USD,
+                "paid_via": "x402 (USDC on Base): resubmit with X-PAYMENT when over the free quota",
+            },
+            "commit_schedule": "Anchors are committed into the next daily Ed25519-signed root "
+                               "(~23:55 UTC), then a signed Merkle inclusion proof is available.",
+            "payments_configured": x402_gate.available(),
+            "docs": f"{base}/llms.txt",
+        })
+
+    def _witness_proof(self, conn, path):
+        from . import attest
+        sha = urllib.parse.unquote(path[len("/witness/proof/"):]).strip().lower()
+        from . import witness
+        norm = witness.normalize_sha256(sha)
+        if norm is None:
+            self._json({"error": "invalid_sha256",
+                        "hint": "Provide a 64-character hex SHA-256 digest."}, 400)
+            return
+        out = attest.prove_anchor(norm, conn=conn)
+        base = self._base_url()
+        if out.get("ok") or out.get("status") == "pending":
+            out.setdefault("verify_url", f"{base}/witness/proof/{norm}")
+            out.setdefault("cli_verify", f"python -m kkj.attest prove-hash {norm}")
+        status = 200 if (out.get("ok") or out.get("status") == "pending") else 404
+        self._json(out, status)
+
+    def _witness_anchor(self, conn, body, client):
+        """POST /witness/anchor — sha256を1件anchor。無料枠超過はx402有料。原文は受け取らない。"""
+        from . import witness, x402_gate
+        base = self._base_url()
+        sha = witness.normalize_sha256((body or {}).get("sha256"))
+        if sha is None:
+            self._json({"error": "invalid_sha256",
+                        "hint": "Submit only a 64-char hex SHA-256 digest in {\"sha256\":...}. "
+                                "Never send raw data — hash it yourself first."}, 400)
+            return
+        # 冪等: 既にanchor済みなら現状を返す(二重課金しない)
+        existing = witness.get(conn, sha)
+        if existing is not None:
+            self._json({
+                "status": existing["status"], "sha256": sha,
+                "already_anchored": True,
+                "proof_url": f"{base}/witness/proof/{sha}",
+                "note": ("Committed." if existing["status"] == "committed"
+                         else "Already accepted; will be in the next daily signed root.")},
+                200)
+            return
+        remaining, needs_payment, global_full = witness.quota_state(conn, client)
+        if global_full:
+            self._json({"error": "daily_capacity_reached",
+                        "hint": "Global daily anchor cap reached; try again tomorrow."}, 429)
+            return
+        if not needs_payment:
+            witness.insert(conn, sha, client, paid=False)
+            self._json({
+                "status": "accepted", "sha256": sha, "paid": False,
+                "free_remaining_today": remaining - 1,
+                "proof_url": f"{base}/witness/proof/{sha}",
+                "note": "Accepted. Will be committed to the next daily Ed25519-signed root "
+                        "(~23:55 UTC). This is a cryptographic timestamp witness, not legal "
+                        "notarization; we stored only your digest.",
+            }, 200)
+            return
+        # 無料枠超過 → x402有料anchor
+        if not x402_gate.available():
+            self._json({"error": "free_quota_exceeded",
+                        "hint": f"Free quota ({witness.FREE_PER_DAY}/day) used. Paid anchoring "
+                                "is not configured on this server right now."}, 429)
+            return
+        resource = f"{base}/witness/anchor"
+        reqs = x402_gate.payment_requirements(
+            resource,
+            "Anchor one SHA-256 digest into the next daily Ed25519-signed hash-chain root "
+            "(signed existence proof / cryptographic timestamp witness). We store only the "
+            "digest, never raw data. Free quota exhausted for today.",
+            price_usd=witness.PRICE_USD,
+        )
+        x_payment = self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", "")
+        if not x_payment:
+            self._json(x402_gate.body_402(reqs, free={
+                "free_quota_per_day": witness.FREE_PER_DAY,
+                "docs": f"{base}/witness"}), 402)
+            return
+        ok, result = x402_gate.verify_and_settle(x_payment, reqs)
+        log_payment_attempt(conn, client, resource, ok, None if ok else result[:300])
+        if not ok:
+            self._json(x402_gate.body_402(reqs, error=result), 402)
+            return
+        witness.insert(conn, sha, client, paid=True)
+        body_out = json.dumps({
+            "status": "accepted", "sha256": sha, "paid": True,
+            "proof_url": f"{base}/witness/proof/{sha}",
+            "note": "Paid anchor accepted. Will be committed to the next daily signed root "
+                    "(~23:55 UTC). Cryptographic timestamp witness, not legal notarization.",
+        }, ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-PAYMENT-RESPONSE", result)
+        self.send_header("Content-Length", str(len(body_out)))
+        self.end_headers()
+        self.wfile.write(body_out)
+
     def _x402_attestations(self, conn):
         """無料: 最新の署名付き日次rootの公開情報(検証手順込み)"""
         from . import attest
@@ -1949,7 +2088,7 @@ a{{color:#0a6}}</style></head><body>
 
     # 公開埋め込み(バッジ・feed・claim)は無償ティア上限の対象外。README等に貼られた
     # バッジがGitHub camo経由で集中アクセスされても壊れないようにする
-    _NO_LIMIT_PREFIXES = ("/badge/", "/x402/trust-feed", "/x402/claim")
+    _NO_LIMIT_PREFIXES = ("/badge/", "/x402/trust-feed", "/x402/claim", "/witness")
 
     def _identify(self, conn, path=""):
         """APIキー検証+無償ティアの日次上限。戻り値: (client識別子, エラー or None)"""
@@ -1968,10 +2107,37 @@ a{{color:#0a6}}</style></head><body>
                                 "hint": "X-API-Key ヘッダで有償キーを指定してください"})
         return ip, None
 
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 1_000_000:
+                return {}
+            return json.loads(self.rfile.read(length))
+        except Exception:
+            return None
+
     def do_POST(self):
-        """MCP Streamable HTTP: POST /mcp にJSON-RPCを受け付ける(リモートMCP対応)"""
+        """POST: /mcp(JSON-RPC) と /witness/anchor(存在証明: sha256のみ)を受け付ける"""
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path.rstrip("/") != "/mcp":
+        ppath = parsed.path.rstrip("/")
+        if ppath == "/witness/anchor":
+            conn = store.connect()
+            try:
+                client, err = self._identify(conn, "/witness/anchor")
+                if err:
+                    self._json(err[1], err[0])
+                    return
+                log_usage(conn, client, self.headers.get("User-Agent"), "/witness/anchor",
+                          is_test=bool(self.headers.get("X-KKJ-Test")))
+                body = self._read_json_body()
+                if body is None:
+                    self._json({"error": "invalid_json"}, 400)
+                    return
+                self._witness_anchor(conn, body, client)
+            finally:
+                conn.close()
+            return
+        if ppath != "/mcp":
             self._json({"error": "not_found"}, 404)
             return
         try:
