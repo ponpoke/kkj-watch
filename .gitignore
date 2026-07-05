@@ -7,10 +7,8 @@ plan
 memo
 memo2
 .env
-docs/sales_onepager.md
-docs/phase0_design.md
-docs/launch_announcement.md
-docs/zenn_article.md
+# 事業ドキュメントは一切公開しない(実在企業の営業リスト・有料商品原稿・内部戦略を含む)
+docs/
 
 __pycache__/
 *.pyc
