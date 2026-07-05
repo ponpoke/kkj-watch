@@ -50,19 +50,31 @@ def last_events(conn, url, n=5):
 
 
 def main():
-    print("== SSRFガード ==")
-    for bad in ("http://a.example/x", "https://127.0.0.1/x", "https://10.0.0.1/x",
+    print("== SSRFガード: _ip_ok(純粋関数・DNS不要) ==")
+    for ip in ("127.0.0.1", "10.0.0.1", "172.16.0.1", "172.31.255.255",
+               "192.168.1.5", "169.254.169.254", "100.64.0.1", "0.0.0.0",
+               "::1", "fc00::1", "fd12::1", "fe80::1", "::ffff:127.0.0.1",
+               "::ffff:10.0.0.1", "224.0.0.1", "198.18.0.1"):
+        check(f"拒否IP: {ip}", not x402probe._ip_ok(ip))
+    for ip in ("1.1.1.1", "8.8.8.8", "203.0.113.0" if False else "104.16.1.1",
+               "2606:4700:4700::1111"):
+        check(f"許可IP: {ip}", x402probe._ip_ok(ip))
+
+    print("== SSRFガード: assert_url_allowed(スキーム+解決IP) ==")
+    for bad in ("ftp://example.com/x", "file:///etc/passwd", "gopher://x/1",
+                "https://127.0.0.1/x", "http://169.254.169.254/latest/meta-data/",
                 "https://[::1]/x", "https://192.168.1.5/x"):
         try:
-            x402probe.assert_public_https(bad)
-            check(f"拒否: {bad}", False)
+            x402probe.assert_url_allowed(bad)
+            check(f"拒否URL: {bad}", False)
         except Exception:
-            check(f"拒否: {bad}", True)
-    try:
-        x402probe.assert_public_https("https://1.1.1.1/x")
-        check("グローバルIPは許可", True)
-    except Exception as e:
-        check("グローバルIPは許可", False, str(e))
+            check(f"拒否URL: {bad}", True)
+    for good in ("https://1.1.1.1/x", "http://1.1.1.1/x"):   # httpも許可(要件)
+        try:
+            x402probe.assert_url_allowed(good)
+            check(f"許可URL: {good}", True)
+        except Exception as e:
+            check(f"許可URL: {good}", False, str(e))
 
     print("== 402本文の解釈と照合 ==")
     la = x402probe.parse_live_accepts(body_402())
@@ -84,7 +96,7 @@ def main():
     conn.executescript(x402probe.SCHEMA_SQL)
     row = conn.execute("SELECT * FROM x402_resources WHERE resource=?",
                        ("https://ok.example/a",)).fetchone()
-    x402probe.assert_public_https = lambda url: None   # DNSなしでテスト
+    x402probe.assert_url_allowed = lambda url: None   # DNSなしでテスト
 
     ts = store.now_utc()
     set_fetch(402, body_402())
@@ -144,6 +156,22 @@ def main():
     t = x402trust.compute(conn, conn.execute(
         "SELECT * FROM x402_resources WHERE resource=?", ("https://ok.example/a",)).fetchone())
     check("非ファームは満点", t["components"]["not_farm"] == 5)
+
+    print("== 選定ヘルパー(why/price/disclaimer) ==")
+    okrow = conn.execute("SELECT * FROM x402_resources WHERE resource=?",
+                         ("https://ok.example/a",)).fetchone()
+    # 検証済み・一致状態にしてから
+    set_fetch(402, body_402())
+    x402probe.probe_one(conn, okrow, ts)
+    t = x402trust.update_score(conn, okrow["id"])
+    why = x402trust.why_reasons(t)
+    check("why[]に肯定的根拠が入る", len(why) >= 2 and any("402" in w for w in why), str(why))
+    rec = json.loads(okrow["latest_json"])
+    check("USDC価格をUSD換算", x402trust.price_usd_min(rec) == 0.001,
+          str(x402trust.price_usd_min(rec)))
+    check("disclaimerは保証でなくリスク指標",
+          "not a safety guarantee" in x402trust.SCORE_DISCLAIMER.lower()
+          or "not a guarantee" in x402trust.SCORE_DISCLAIMER.lower())
 
     print("== 対象選定(ホスト集中回避) ==")
     picked = x402probe.pick_targets(conn, 100)

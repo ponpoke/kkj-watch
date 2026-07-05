@@ -23,14 +23,14 @@ Bazaarに掲載されている公開resourceに「未払いのGETリクエスト
   python -m kkj.x402probe run [budget]   # 1サイクル(既定400件)
   python -m kkj.x402probe stats
 """
+import http.client
 import ipaddress
 import json
 import socket
+import ssl
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 from . import store, x402watch
 
@@ -74,45 +74,118 @@ def canon_network(net):
     return NETWORK_ALIASES.get(net or "", net or "")
 
 
-def assert_public_https(url: str):
-    """SSRF防御: https限定+ホスト名の解決結果が全てグローバルIPであること"""
-    p = urllib.parse.urlsplit(url)
-    if p.scheme != "https":
-        raise ValueError(f"https required: {p.scheme}")
-    host = p.hostname
-    if not host:
-        raise ValueError("no hostname")
-    infos = socket.getaddrinfo(host, p.port or 443, proto=socket.IPPROTO_TCP)
+# SSRF: 明示的に拒否する非公開/特殊用途レンジ(is_globalに加えた二重防御)
+ALLOWED_SCHEMES = ("http", "https")
+BLOCKED_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8",          # このホスト
+    "127.0.0.0/8",        # ループバック
+    "10.0.0.0/8",         # プライベート
+    "172.16.0.0/12",      # プライベート
+    "192.168.0.0/16",     # プライベート
+    "169.254.0.0/16",     # リンクローカル(=クラウドmetadata 169.254.169.254)
+    "100.64.0.0/10",      # CGNAT
+    "192.0.0.0/24", "192.0.2.0/24", "198.18.0.0/15", "198.51.100.0/24",
+    "203.0.113.0/24",     # 特殊用途/ドキュメント用
+    "::1/128",            # IPv6ループバック
+    "fc00::/7",           # IPv6ユニークローカル
+    "fe80::/10",          # IPv6リンクローカル
+    "::ffff:0:0/96",      # IPv4射影(::ffff:127.0.0.1等での回避を防ぐ)
+    "64:ff9b::/96",       # NAT64
+))
+
+
+def _ip_ok(ip_str: str) -> bool:
+    """公開IPのみ許可。is_global かつ 明示ブロックレンジに属さないこと"""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        return _ip_ok(str(ip.ipv4_mapped))     # ::ffff:10.0.0.1 等を実IPで判定
+    if not ip.is_global:
+        return False
+    if ip.is_multicast or ip.is_reserved or ip.is_loopback or ip.is_link_local:
+        return False
+    return not any(ip in net for net in BLOCKED_NETS)
+
+
+def resolve_public_ips(host: str, port: int):
+    """ホスト名を解決し、返った全IPが公開IPであることを検証。
+    1つでも非公開が混じれば拒否(DNSリバインディングの的を減らす)。戻り値: [(family, ip)]"""
+    infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    out = []
     for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if not ip.is_global:
-            raise ValueError(f"non-public address: {ip}")
+        ip = info[4][0]
+        if not _ip_ok(ip):
+            raise ValueError(f"non-public address {ip} for host {host}")
+        out.append((info[0], ip))
+    if not out:
+        raise ValueError(f"no addresses for {host}")
+    return out
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k):
-        return None                      # リダイレクトは追従しない(SSRF/クローク対策)
+def assert_url_allowed(url: str):
+    """SSRF防御の入口: スキーム検査 + 解決した全IPが公開IPであること"""
+    p = urllib.parse.urlsplit(url)
+    if p.scheme not in ALLOWED_SCHEMES:
+        raise ValueError(f"scheme not allowed: {p.scheme or '(none)'}")
+    if not p.hostname:
+        raise ValueError("no hostname")
+    port = p.port or (443 if p.scheme == "https" else 80)
+    resolve_public_ips(p.hostname, port)
 
 
-_opener = urllib.request.build_opener(_NoRedirect)
+def _pinned_connection(scheme, host, ip, port):
+    """検証済みIPへ接続をピン留めしたHTTP(S)接続。
+    SNI/証明書検証/Hostヘッダは本来のホスト名で行いつつ、TCP接続先だけを
+    検証済みIPに固定する = 検査後の再解決による差し替え(リバインディング)を封じる。"""
+    if scheme == "https":
+        ctx = ssl.create_default_context()
+        conn = http.client.HTTPSConnection(host, port, timeout=TIMEOUT, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=TIMEOUT)
+    conn._create_connection = (
+        lambda address, timeout=TIMEOUT, source_address=None:
+        socket.create_connection((ip, port), timeout=timeout))
+    return conn
 
 
 def fetch(url: str):
-    """未払いGET。戻り値: (http_status|None, body_bytes, latency_ms, error|None)"""
-    req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT, "Accept": "application/json"})
-    t0 = time.monotonic()
+    """未払いGET(不払い・リダイレクト非追従・IPピン留め)。
+    戻り値: (http_status|None, body_bytes, latency_ms, error|None)"""
+    p = urllib.parse.urlsplit(url)
+    if p.scheme not in ALLOWED_SCHEMES:
+        return None, b"", 0, f"scheme not allowed: {p.scheme or '(none)'}"
+    host = p.hostname
+    if not host:
+        return None, b"", 0, "no hostname"
+    port = p.port or (443 if p.scheme == "https" else 80)
     try:
-        with _opener.open(req, timeout=TIMEOUT) as resp:
-            return resp.status, resp.read(MAX_BODY), int((time.monotonic() - t0) * 1000), None
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read(MAX_BODY)
-        except Exception:
-            body = b""
-        return e.code, body, int((time.monotonic() - t0) * 1000), None
+        family, ip = resolve_public_ips(host, port)[0]   # 検証済みIPへピン留め
+    except Exception as e:
+        return None, b"", 0, f"blocked: {e}"
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
+    t0 = time.monotonic()
+    conn = None
+    try:
+        conn = _pinned_connection(p.scheme, host, ip, port)
+        # http.client はリダイレクトを追従しない(3xxはそのまま返る)
+        conn.request("GET", path, headers={
+            "User-Agent": USER_AGENT, "Accept": "application/json",
+            "Connection": "close"})
+        resp = conn.getresponse()
+        body = resp.read(MAX_BODY)
+        return resp.status, body, int((time.monotonic() - t0) * 1000), None
     except Exception as e:
         return None, b"", int((time.monotonic() - t0) * 1000), str(e)[:200]
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def parse_live_accepts(body: bytes):
@@ -196,13 +269,13 @@ def probe_one(conn, row, ts):
     prev_cons = prev["consistency"] if prev else None
 
     try:
-        assert_public_https(url)
+        assert_url_allowed(url)
     except Exception as e:
         conn.execute(
             "INSERT INTO x402_probes(resource_id, probed_at, alive, http_status, is_402,"
             " latency_ms, live_accepts_json, consistency, fail_count, error)"
             " VALUES (?,?,0,NULL,0,NULL,NULL,?,?,?)",
-            (rid, ts, f"skipped:unsafe_url", prev_fails, str(e)[:200]))
+            (rid, ts, "skipped:unsafe_url", prev_fails, str(e)[:200]))
         return "skipped"
 
     status, body, latency, err = fetch(url)

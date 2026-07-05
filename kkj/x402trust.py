@@ -174,6 +174,50 @@ def compute(conn, row):
     }
 
 
+SCORE_DISCLAIMER = (
+    "Observed, evidence-based risk indicator - NOT a safety guarantee. Based on past "
+    "registry observations, listing-vs-live consistency, and live GET-only probes. "
+    "Always verify payment terms yourself before paying.")
+
+
+def price_usd_min(rec: dict):
+    """掲載accountsの最小USD価格(USDCのみ換算)。換算不能ならNone"""
+    best = None
+    for a in rec.get("accepts", []):
+        usd = x402watch.usd_of(a.get("amount"), a.get("asset"))
+        if usd is not None and (best is None or usd < best):
+            best = usd
+    return best
+
+
+def why_reasons(trust: dict) -> list:
+    """スコアの内訳から「なぜ選ぶに足るか」の肯定的根拠を生成(観測事実ベース)"""
+    v = trust.get("verdicts", {})
+    c = trust.get("components", {})
+    why = []
+    if v.get("verified_live"):
+        why.append("served a valid 402 on the most recent live probe")
+    if v.get("listing_matches_live") == "ok":
+        why.append("registry and live payment terms (price, payTo) match")
+    if v.get("payto_risk") == "none":
+        why.append("payTo stable - no changes or live mismatches in 90 days")
+    if c.get("price_stability") == 10:
+        why.append("low price volatility (no changes in 30 days)")
+    if c.get("listing_stability") == 10:
+        why.append("listing stable — no delist/relist churn in 30 days")
+    if not v.get("farm_member"):
+        why.append("payTo not part of a detected spam farm")
+    age = trust.get("age_days")
+    if age is not None and age >= 30:
+        why.append(f"listed and observed for {int(age)}+ days")
+    return why
+
+
+def caveats(trust: dict) -> list:
+    """選定時にエージェントへ返す注意点(観測上の弱点)。trust.reasonsの外向き版"""
+    return list(trust.get("reasons", []))
+
+
 def _epoch(iso: str) -> float:
     from datetime import datetime
     try:

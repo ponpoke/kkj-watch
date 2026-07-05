@@ -25,18 +25,22 @@ LLMS_TXT = """# kkj-watch — change detection for machines
 > 2. JAPANESE PROCUREMENT WATCH — corrections, deadline changes, requirement changes and document
 >    replacements in Japanese government tenders (kkj.go.jp), with before/after, impact tags and quotes.
 
-## x402 Trust Index (free)
+## x402 Trust Index (free) — an OBSERVED, evidence-based risk score (not a guarantee)
 
 The Bazaar registry has 23,000+ listings; many are dead tests, spam farms, or inconsistent with what
-the live endpoint actually serves. The Trust Index scores every listed resource 0-100 with a
-deterministic, versioned, fully-explained formula (no LLM): liveness (GET-only live probes),
-listing-vs-live consistency (price and payTo served by the real endpoint vs the registry),
-payTo stability (a changed receiving address is a hijack signal the 402 flow will NOT catch —
-it pays the new address blindly), listing age/stability, and spam-farm detection
-(one payTo behind dozens of listings).
+the live endpoint actually serves. The Trust Index assigns each listed resource an *observed trust
+score* 0-100 with a deterministic, versioned, fully-explained formula (no LLM). It is a RISK
+INDICATOR based on past observations, listing-vs-live consistency, and live GET-only probes —
+NOT a safety guarantee. Signals: liveness (GET-only probes), listing-vs-live consistency (price
+and payTo served by the real endpoint vs the registry), payTo stability (a changed receiving
+address is a hijack signal the 402 flow will NOT catch — it pays the new address blindly),
+listing age/stability, and spam-farm detection (one payTo behind dozens of listings).
 
-- GET /x402/trust/{id-or-url} : trust score + grade (A-F) + verdicts + every deduction reason
-- GET /x402/leaderboard : top-scored verified resources (use to CHOOSE which endpoint to pay)
+- GET /x402/best?q=web+search&max_price_usd=0.01&min_trust=80 : SELECTION API — returns the single
+  recommended resource for a task/budget plus alternatives, each with a "why" list. This is usually
+  what an agent wants: not a score, but "which endpoint should I use, that is cheap and low-risk?"
+- GET /x402/leaderboard?q=search : resources ranked by observed trust score (filter by keyword/tag)
+- GET /x402/trust/{id-or-url} : observed trust score + grade (A-F) + verdicts + every deduction reason
 - GET /x402/changes : change feed (price_changed | payto_changed | live_payto_mismatch |
   endpoint_dead | schema_changed | delisted ...). ?type= and ?severity=critical filters.
 - GET /x402/resources?q=search : search the monitored registry inventory (returns resource ids)
@@ -80,10 +84,15 @@ get_tender_change_evidence (free, full evidence) / get_cached_tender_requirement
 
 ## When to use what
 
-- Choosing which x402 endpoint to pay? -> GET /x402/leaderboard (free).
+- "Which endpoint should I use for X, cheap and low-risk?" -> GET /x402/best?q=X (free) — returns
+  a recommended_resource + why[] + alternatives.
+- Browse the ranking? -> GET /x402/leaderboard?q=X (free).
 - About to pay a specific endpoint? -> GET /x402/trust/{id-or-url} (free) — check payto_risk first.
 - Need the full due-diligence dossier? -> GET /paid/x402/report/{id} ($0.02).
 - Need raw snapshot/event history only? -> GET /paid/x402/history/{id} ($0.01).
+
+The score is an observed, evidence-based risk indicator, not a safety guarantee. Always verify
+payment terms before paying.
 - Just want the procurement change feed? -> GET /events (free). Filter with ?tag=.
 - Need to know if you qualify / what to submit? -> GET /paid/requirements/{key} (cached, $0.02).
 - No cached data yet for that tender? -> GET /paid/analyze-now/{key} ($0.30, runs extraction).
@@ -368,7 +377,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/x402/trust/"):
                 self._x402_trust(conn, path)
             elif path == "/x402/leaderboard":
-                self._x402_leaderboard(conn, limit)
+                self._x402_leaderboard(conn, limit,
+                                       (qs.get("q") or qs.get("category") or [""])[0])
+            elif path == "/x402/best":
+                self._x402_best(conn, qs)
             elif path.startswith("/paid/x402/history/"):
                 self._paid_x402_history(conn, path)
             elif path.startswith("/paid/x402/report/"):
@@ -543,8 +555,9 @@ class Handler(BaseHTTPRequestHandler):
                 "tender_search": f"{base}/cases?query=cloud",
                 "sample": f"{base}/sample-diff",
                 "evidence_page": f"{base}/case/{{key}}",
-                "x402_trust_score": f"{base}/x402/trust/{{id-or-url}}",
-                "x402_trust_leaderboard": f"{base}/x402/leaderboard",
+                "x402_select_best": f"{base}/x402/best?q=web+search&max_price_usd=0.01&min_trust=80",
+                "x402_observed_trust_score": f"{base}/x402/trust/{{id-or-url}}",
+                "x402_leaderboard": f"{base}/x402/leaderboard?q=search",
                 "x402_registry_changes": f"{base}/x402/changes?type=payto_changed",
                 "x402_registry_search": f"{base}/x402/resources?q=search",
                 "x402_sample": f"{base}/x402/sample-change",
@@ -729,25 +742,42 @@ class Handler(BaseHTTPRequestHandler):
             "service": "x402 Trust Index (kkj-watch)",
             "resource": row["resource"], "service_name": row["service_name"],
             "id": row["id"],
+            "score_type": "observed_trust_score",
+            "disclaimer": x402trust.SCORE_DISCLAIMER,
+            "observed_trust_score": trust.get("score"),
             "trust": trust,
-            "how_scored": "Deterministic, versioned formula over registry history "
+            "how_scored": "Deterministic, versioned formula over observed registry history "
                           "(hourly Bazaar sync since 2026-07) and live GET-only probes. "
-                          "All deductions are listed in trust.reasons — verify them yourself.",
-            "full_evidence": f"{base}/paid/x402/report/{row['id']} ($0.02, x402): trust + "
+                          "All deductions are listed in trust.reasons — verify them yourself. "
+                          "This is a risk indicator, not a safety guarantee.",
+            "select_for_task": f"{base}/x402/best?q=&min_trust=80&max_price_usd=0.01",
+            "full_evidence": f"{base}/paid/x402/report/{row['id']} ($0.02, x402): score + "
                              "full snapshot history + all probe results.",
             "free_feed": f"{base}/x402/changes",
         })
 
-    def _x402_leaderboard(self, conn, limit):
-        """無料: 検証済みリソースの格付け上位(エージェントのサービス選定用)"""
+    def _x402_scored_rows(self, conn, q=""):
+        """スコア付き有効リソースを取得(q でresource/service/tags/description を絞り込み)"""
+        from . import x402trust
+        x402trust._migrate(conn)
+        if q:
+            return conn.execute(
+                """SELECT * FROM x402_resources
+                   WHERE active=1 AND trust_score IS NOT NULL
+                     AND (resource LIKE ? OR service_name LIKE ? OR latest_json LIKE ?)
+                   ORDER BY trust_score DESC, id ASC LIMIT 500""",
+                (f"%{q}%", f"%{q}%", f"%{q}%")).fetchall()
+        return conn.execute(
+            """SELECT * FROM x402_resources WHERE active=1 AND trust_score IS NOT NULL
+               ORDER BY trust_score DESC, id ASC LIMIT 500""").fetchall()
+
+    def _x402_leaderboard(self, conn, limit, q=""):
+        """無料: 観測ベースのリスク指標で並べた上位(サービス選定の入口)"""
         from . import x402watch, x402trust
         conn.executescript(x402watch.SCHEMA_SQL)
-        x402trust._migrate(conn)
         base = self._base_url()
         limit = min(limit, 100)
-        rows = conn.execute(
-            """SELECT * FROM x402_resources WHERE active=1 AND trust_score IS NOT NULL
-               ORDER BY trust_score DESC, id ASC LIMIT ?""", (limit,)).fetchall()
+        rows = self._x402_scored_rows(conn, q)[:limit]
         items = []
         for r in rows:
             t = json.loads(r["trust_json"]) if r["trust_json"] else {}
@@ -759,7 +789,8 @@ class Handler(BaseHTTPRequestHandler):
                                **({"usd": usd} if usd is not None else {})})
             items.append({
                 "id": r["id"], "resource": r["resource"], "service_name": r["service_name"],
-                "score": r["trust_score"], "grade": t.get("grade"),
+                "observed_trust_score": r["trust_score"], "grade": t.get("grade"),
+                "price_usd": x402trust.price_usd_min(rec),
                 "verdicts": t.get("verdicts"), "prices": prices,
                 "last_verified_at": t.get("last_verified_at"),
                 "trust_detail": f"{base}/x402/trust/{r['id']}",
@@ -768,12 +799,85 @@ class Handler(BaseHTTPRequestHandler):
             "SELECT COUNT(*) n FROM x402_resources WHERE trust_score IS NOT NULL").fetchone()["n"]
         self._json({
             "service": "x402 Trust Index (kkj-watch)",
-            "description": "Bazaar-listed x402 resources ranked by trust score (0-100): "
-                           "liveness, listing-vs-live consistency, payTo stability, age, "
-                           "spam-farm detection. Use before choosing which endpoint to pay.",
+            "score_type": "observed_trust_score",
+            "disclaimer": x402trust.SCORE_DISCLAIMER,
+            "description": "Bazaar-listed x402 resources ranked by an observed, evidence-based "
+                           "risk score (0-100): liveness, listing-vs-live consistency, payTo "
+                           "stability, age, spam-farm detection. Filter with ?q= (keyword/tag).",
+            "query": q or None,
             "scored_resources": scored,
             "count": len(items), "items": items,
+            "select_for_task": f"{base}/x402/best?q=web+search&max_price_usd=0.01&min_trust=80",
             "check_any": f"{base}/x402/trust/{{id-or-url}}",
+        })
+
+    def _x402_best(self, conn, qs):
+        """無料: 選定API — 用途/予算/最低スコアの条件で「使うべき1件+代替」を返す。
+        エージェントが欲しいのはスコアそのものより『失敗しにくく安く信頼できる選択』"""
+        from . import x402watch, x402trust
+        conn.executescript(x402watch.SCHEMA_SQL)
+        base = self._base_url()
+        q = (qs.get("q") or qs.get("category") or qs.get("task") or [""])[0].strip()
+        try:
+            max_price = float((qs.get("max_price_usd") or ["0"])[0]) or None
+        except ValueError:
+            max_price = None
+        try:
+            min_trust = float((qs.get("min_trust") or ["0"])[0])
+        except ValueError:
+            min_trust = 0.0
+        prefer_verified = (qs.get("require_live") or ["1"])[0] not in ("0", "false", "no")
+
+        candidates = []
+        for r in self._x402_scored_rows(conn, q):
+            if r["trust_score"] < min_trust:
+                continue
+            t = json.loads(r["trust_json"]) if r["trust_json"] else {}
+            rec = json.loads(r["latest_json"])
+            price = x402trust.price_usd_min(rec)
+            if max_price is not None and (price is None or price > max_price):
+                continue
+            if prefer_verified and not t.get("verdicts", {}).get("verified_live"):
+                continue
+            # payTo不一致(乗っ取り兆候)は選定から常に除外
+            if t.get("verdicts", {}).get("payto_risk") == "live_mismatch":
+                continue
+            candidates.append((r, t, rec, price))
+
+        def rank_key(item):
+            r, t, rec, price = item
+            return (-r["trust_score"], price if price is not None else 9e9, r["id"])
+        candidates.sort(key=rank_key)
+
+        def entry(item):
+            r, t, rec, price = item
+            return {
+                "resource": r["resource"], "id": r["id"],
+                "service_name": r["service_name"],
+                "observed_trust_score": r["trust_score"], "grade": t.get("grade"),
+                "price_usd": price,
+                "why": x402trust.why_reasons(t),
+                "caveats": x402trust.caveats(t),
+                "last_verified_at": t.get("last_verified_at"),
+                "trust_detail": f"{base}/x402/trust/{r['id']}",
+                "full_report": f"{base}/paid/x402/report/{r['id']} ($0.02)",
+            }
+
+        recommended = entry(candidates[0]) if candidates else None
+        alternatives = [entry(c) for c in candidates[1:6]]
+        self._json({
+            "service": "x402 Trust Index — endpoint selection (kkj-watch)",
+            "score_type": "observed_trust_score",
+            "disclaimer": x402trust.SCORE_DISCLAIMER,
+            "query": {"q": q or None, "max_price_usd": max_price,
+                      "min_trust": min_trust, "require_live": prefer_verified},
+            "matched": len(candidates),
+            "recommended_resource": (recommended or {}).get("resource"),
+            "recommended": recommended,
+            "alternatives": alternatives,
+            "note": "Ranked by observed trust then lowest price. payTo-mismatch endpoints are "
+                    "excluded. This is an evidence-based recommendation, not a guarantee — "
+                    "check 'caveats' and verify payment terms before paying.",
         })
 
     def _x402_report_payload(self, conn, row):
@@ -941,8 +1045,11 @@ class Handler(BaseHTTPRequestHandler):
                 "/x402/changes": op("x402 Bazaar registry change events (free)",
                                     ["type", "severity", "limit"]),
                 "/x402/resources": op("Search the monitored x402 registry (free)", ["q", "limit"]),
-                "/x402/trust/{id}": op("Trust score 0-100 + verdicts for one x402 resource (free)"),
-                "/x402/leaderboard": op("Top-scored verified x402 resources (free)", ["limit"]),
+                "/x402/best": op("Select the best x402 endpoint for a task/budget (free)",
+                                 ["q", "category", "max_price_usd", "min_trust", "require_live"]),
+                "/x402/trust/{id}": op("Observed trust score 0-100 + verdicts (free, not a guarantee)"),
+                "/x402/leaderboard": op("x402 resources ranked by observed trust score (free)",
+                                        ["q", "limit"]),
                 "/x402/sample-change": op("Sample registry change event (free)"),
                 "/paid/requirements/{key}": op(
                     "Structured bidding requirements, $0.02 via x402", paid=True),
@@ -975,10 +1082,14 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": "procurement_changes",
                  "name": "Japanese procurement change feed",
                  "description": f"GET {base}/events?tag=deadline_affecting (free)"},
+                {"id": "x402_select_best",
+                 "name": "x402 endpoint selection",
+                 "description": f"GET {base}/x402/best?q=web+search&max_price_usd=0.01 (free) — "
+                                "recommended endpoint + why, by observed risk score & price"},
                 {"id": "x402_trust_index",
-                 "name": "x402 Trust Index",
-                 "description": f"GET {base}/x402/trust/{{id-or-url}} (free) — trust score 0-100 "
-                                "before paying any x402 endpoint"},
+                 "name": "x402 Trust Index (observed risk score)",
+                 "description": f"GET {base}/x402/trust/{{id-or-url}} (free) — observed, "
+                                "evidence-based risk score before paying any x402 endpoint"},
                 {"id": "x402_registry_changes",
                  "name": "x402 registry change feed",
                  "description": f"GET {base}/x402/changes?type=payto_changed (free)"},

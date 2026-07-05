@@ -14,13 +14,35 @@ PROTOCOL_VERSION = "2025-06-18"
 
 TOOLS = [
     {
+        "name": "recommend_x402_endpoint",
+        "description": "Given a task and budget, recommend which x402 Bazaar endpoint to use. "
+                       "Returns a recommended resource + alternatives, each with a 'why' list "
+                       "(alive on recent probes, registry/live terms match, payTo stable, low "
+                       "price volatility). Ranks by an OBSERVED, evidence-based risk score then "
+                       "lowest price; excludes endpoints whose live payTo differs from the "
+                       "registry. This is what you usually want: not a raw score, but 'which "
+                       "cheap, low-risk endpoint should I call?'. Not a safety guarantee.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "q": {"type": "string", "description": "task/keyword/category (e.g. web search, "
+                                                       "price feed, twitter)"},
+                "max_price_usd": {"type": "number", "description": "max acceptable USD price/call"},
+                "min_trust": {"type": "number", "description": "minimum observed trust score (0-100)"},
+                "require_live": {"type": "boolean",
+                                 "description": "only endpoints verified live on last probe (default true)"},
+            },
+        },
+    },
+    {
         "name": "check_x402_endpoint_trust",
-        "description": "Check the trust score (0-100, grade A-F) of an x402 Bazaar resource "
-                       "BEFORE paying it. Combines liveness probes, listing-vs-live consistency "
-                       "(does the real endpoint serve the same price and payTo as the registry?), "
-                       "payTo stability (a changed receiving address is a hijack signal the 402 "
-                       "flow pays blindly), listing age and spam-farm detection. Free, "
-                       "deterministic, all deduction reasons included.",
+        "description": "Get the OBSERVED trust score (0-100, grade A-F) of one x402 Bazaar resource "
+                       "BEFORE paying it. An evidence-based risk indicator (NOT a safety guarantee) "
+                       "combining liveness probes, listing-vs-live consistency (does the real "
+                       "endpoint serve the same price and payTo as the registry?), payTo stability "
+                       "(a changed receiving address is a hijack signal the 402 flow pays blindly), "
+                       "listing age and spam-farm detection. Deterministic; all deduction reasons "
+                       "included so you can verify them yourself.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -33,11 +55,12 @@ TOOLS = [
     },
     {
         "name": "list_x402_trusted_endpoints",
-        "description": "Ranked list of verified, trustworthy x402 resources (Trust Index "
-                       "leaderboard). Use to choose which paid endpoint to call. Free.",
+        "description": "x402 resources ranked by observed trust score (leaderboard). Filter by "
+                       "keyword/tag with q. An evidence-based ranking, not a guarantee. Free.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "q": {"type": "string", "description": "keyword/tag filter"},
                 "limit": {"type": "integer", "description": "max items (default 20)"},
             },
         },
@@ -259,21 +282,86 @@ def tool_check_trust(args):
     return out
 
 
+def _scored_rows(conn, q=""):
+    from . import x402trust
+    x402trust._migrate(conn)
+    if q:
+        return conn.execute(
+            """SELECT * FROM x402_resources WHERE active=1 AND trust_score IS NOT NULL
+               AND (resource LIKE ? OR service_name LIKE ? OR latest_json LIKE ?)
+               ORDER BY trust_score DESC, id ASC LIMIT 500""",
+            (f"%{q}%", f"%{q}%", f"%{q}%")).fetchall()
+    return conn.execute(
+        """SELECT * FROM x402_resources WHERE active=1 AND trust_score IS NOT NULL
+           ORDER BY trust_score DESC, id ASC LIMIT 500""").fetchall()
+
+
 def tool_trust_leaderboard(args):
-    """Trustスコア上位(無料)"""
-    from . import x402watch, x402trust
+    """観測トラストスコア上位(無料)"""
+    from . import x402watch
     limit = min(int(args.get("limit", 20)), 100)
+    q = str(args.get("q", "")).strip()
     conn = store.connect()
     conn.executescript(x402watch.SCHEMA_SQL)
-    x402trust._migrate(conn)
     out = []
-    for r in conn.execute(
-            """SELECT * FROM x402_resources WHERE active=1 AND trust_score IS NOT NULL
-               ORDER BY trust_score DESC, id ASC LIMIT ?""", (limit,)).fetchall():
+    for r in _scored_rows(conn, q)[:limit]:
         t = json.loads(r["trust_json"]) if r["trust_json"] else {}
         out.append({"id": r["id"], "resource": r["resource"],
-                    "service_name": r["service_name"], "score": r["trust_score"],
+                    "service_name": r["service_name"],
+                    "observed_trust_score": r["trust_score"],
                     "grade": t.get("grade"), "verdicts": t.get("verdicts")})
+    conn.close()
+    return {"score_type": "observed_trust_score", "count": len(out), "items": out}
+
+
+def tool_recommend(args):
+    """選定API: 用途/予算で使うべき1件+代替を返す(無料)"""
+    from . import x402watch, x402trust
+    q = str(args.get("q") or args.get("category") or args.get("task") or "").strip()
+    try:
+        max_price = float(args.get("max_price_usd") or 0) or None
+    except (TypeError, ValueError):
+        max_price = None
+    try:
+        min_trust = float(args.get("min_trust") or 0)
+    except (TypeError, ValueError):
+        min_trust = 0.0
+    require_live = args.get("require_live", True) not in (False, 0, "0", "false", "no")
+    conn = store.connect()
+    conn.executescript(x402watch.SCHEMA_SQL)
+    cands = []
+    for r in _scored_rows(conn, q):
+        if r["trust_score"] < min_trust:
+            continue
+        t = json.loads(r["trust_json"]) if r["trust_json"] else {}
+        rec = json.loads(r["latest_json"])
+        price = x402trust.price_usd_min(rec)
+        if max_price is not None and (price is None or price > max_price):
+            continue
+        if require_live and not t.get("verdicts", {}).get("verified_live"):
+            continue
+        if t.get("verdicts", {}).get("payto_risk") == "live_mismatch":
+            continue
+        cands.append((r, t, price))
+    cands.sort(key=lambda x: (-x[0]["trust_score"], x[2] if x[2] is not None else 9e9, x[0]["id"]))
+
+    def entry(item):
+        r, t, price = item
+        return {"resource": r["resource"], "id": r["id"],
+                "service_name": r["service_name"],
+                "observed_trust_score": r["trust_score"], "grade": t.get("grade"),
+                "price_usd": price, "why": x402trust.why_reasons(t),
+                "caveats": x402trust.caveats(t)}
+    out = {
+        "score_type": "observed_trust_score",
+        "disclaimer": x402trust.SCORE_DISCLAIMER,
+        "query": {"q": q or None, "max_price_usd": max_price, "min_trust": min_trust,
+                  "require_live": require_live},
+        "matched": len(cands),
+        "recommended_resource": cands[0][0]["resource"] if cands else None,
+        "recommended": entry(cands[0]) if cands else None,
+        "alternatives": [entry(c) for c in cands[1:6]],
+    }
     conn.close()
     return out
 
@@ -292,6 +380,7 @@ def tool_get_requirements(args):
 
 HANDLERS = {
     # 目的ベースの新名(外部エージェント向け)
+    "recommend_x402_endpoint": tool_recommend,
     "check_x402_endpoint_trust": tool_check_trust,
     "list_x402_trusted_endpoints": tool_trust_leaderboard,
     "list_x402_registry_changes": tool_list_x402_changes,
