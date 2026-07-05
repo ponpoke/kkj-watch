@@ -4,6 +4,27 @@
 > 1. **x402 registry watch**: every change in the x402 Bazaar registry (23k+ resources) — `price_changed`, `payto_changed` (receiving-address change: verify before paying), `schema_changed`, listings/delistings. Free: `/x402/changes` (filter `?type=`), `/x402/resources?q=`, `/x402/sample-change`. Paid: `/paid/x402/history/{id}` ($0.01, full SHA-256 audit trail).
 > 2. **Japanese procurement watch**: corrections, deadline changes, document replacements. Free: `/events` (filter `?tag=`), `/cases?query=`, `/sample-diff`, `/agent.json`. Paid (x402): `/paid/requirements/{key}` ($0.02, cached), `/paid/analyze-now/{key}` ($0.30, fresh LLM).
 
+## Trust バッジ(売り手向け・#3) と Trust フィード(発見層向け・#2)
+
+**売り手**は、自分のx402エンドポイントの観測Trustを README/サイトに貼れます(被リンク＝流入):
+
+```markdown
+[![x402 trust](https://5.75.142.199.sslip.io/badge/x402/{id}.svg)](https://5.75.142.199.sslip.io/x402/trust/{id})
+```
+
+- 貼り付けスニペット: `GET /x402/claim/{id}`（markdown/html/shields.io の3形式）
+- バッジ本体: `GET /badge/x402/{id}.svg`（`.json` は shields.io endpoint 互換）
+- payTo不一致は自動で赤 `payTo mismatch` 表示。署名アテステーションがあれば `✓`
+
+**発見層(x402scan/Bazaar/explorer)** は、公開フィードを取り込んで各resource横にTrustを表示できます:
+
+```
+GET /x402/trust-feed.json     # 全件(resource, trust_score, grade, payto_status, badge_url, detail_url, attestation_root)
+GET /x402/trust-feed.ndjson   # 1行1レコード(ストリーム取り込み向け)
+```
+
+いずれも「観測ベースのリスク指標であって安全保証ではない」旨を含み、日次署名rootに裏付けられます。
+
 ## x402guard — 支払い直前の安全チェックを1行で(クライアント側ミドルウェア)
 
 エージェントに新しい習慣を求めず、**既存の支払い呼び出しをラップするだけ**で、payTo乗っ取り・価格改竄・低信頼・掲載消失を pay 前に検知して止める、ゼロ依存(標準ライブラリのみ)の安全レイヤー。`x402guard/` を参照。

@@ -39,6 +39,13 @@ so the score is backed by a record you can prove was not back-dated.
 - GET /paid/x402/attest/{id} : $0.02 — signed inclusion proof that a resource's observed record is
   committed to that day's root (evidence you can show a third party / keep in a decision log)
 
+### For catalogs & sellers (free)
+
+- GET /x402/trust-feed.json (also .ndjson) : the whole Trust Index as a feed — ingest it to show
+  a trust score / payTo-mismatch flag next to each x402 resource in your explorer or catalog.
+- GET /badge/x402/{id}.svg : a seller-displayable badge (also .json, shields.io-compatible).
+  Sellers: get your copy-paste snippet at GET /x402/claim/{id} — show buyers your observed trust.
+
 ### x402guard — check before you pay (drop-in, free, open source)
 
 Don't want to call an API by hand? Wrap your existing x402 payment in one line and it checks
@@ -212,7 +219,7 @@ _PROBE_UA = _re.compile(
 # 実データを取得する無料エンドポイント(意図ある利用)
 _FREE_DATA_PATHS = ("/events", "/sample-diff",
                     "/x402/changes", "/x402/resources", "/x402/sample-change",
-                    "/x402/attestations")
+                    "/x402/attestations", "/x402/trust-feed.json", "/x402/trust-feed.ndjson")
 
 
 def classify_usage(path, user_agent, query_has_filter):
@@ -279,6 +286,46 @@ def usage_stats(conn):
     }
 
 
+def _row_get(row, col):
+    """sqlite3.Row から安全に取得(列が無ければNone)"""
+    try:
+        return row[col]
+    except (KeyError, IndexError):
+        return None
+
+
+def _svg_badge(label, message, color):
+    """依存なしの2セグメントSVGバッジ(shields flat風)。GitHub READMEでそのまま描画される"""
+    def w(s):   # おおよその文字幅(px)。日本語/記号も含め安全側に広めに見積もる
+        width = 0
+        for ch in s:
+            width += 7 if ord(ch) > 0x2000 else 6.5
+        return int(width) + 10
+    lw, mw = w(label), w(message)
+    total = lw + mw
+    esc = lambda s: (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    label_e, msg_e = esc(label), esc(message)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{total}" height="20" '
+        f'role="img" aria-label="{label_e}: {msg_e}">'
+        f'<title>{label_e}: {msg_e}</title>'
+        f'<linearGradient id="s" x2="0" y2="100%">'
+        f'<stop offset="0" stop-color="#bbb" stop-opacity=".1"/>'
+        f'<stop offset="1" stop-opacity=".1"/></linearGradient>'
+        f'<clipPath id="r"><rect width="{total}" height="20" rx="3" fill="#fff"/></clipPath>'
+        f'<g clip-path="url(#r)">'
+        f'<rect width="{lw}" height="20" fill="#555"/>'
+        f'<rect x="{lw}" width="{mw}" height="20" fill="{color}"/>'
+        f'<rect width="{total}" height="20" fill="url(#s)"/></g>'
+        f'<g fill="#fff" text-anchor="middle" '
+        f'font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">'
+        f'<text x="{lw/2:.0f}" y="15" fill="#010101" fill-opacity=".3">{label_e}</text>'
+        f'<text x="{lw/2:.0f}" y="14">{label_e}</text>'
+        f'<text x="{lw + mw/2:.0f}" y="15" fill="#010101" fill-opacity=".3">{msg_e}</text>'
+        f'<text x="{lw + mw/2:.0f}" y="14">{msg_e}</text>'
+        f'</g></svg>')
+
+
 def case_summary(row):
     rec = json.loads(row["latest_json"])
     return {
@@ -318,7 +365,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
         conn = store.connect()
         try:
-            client, err = self._identify(conn)
+            client, err = self._identify(conn, path)
             if err:
                 self._json(err[1], err[0])
                 return
@@ -408,6 +455,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._paid_x402_attest(conn, path)
             elif path == "/x402/attestations":
                 self._x402_attestations(conn)
+            elif path.startswith("/badge/x402/"):
+                self._x402_badge(conn, path)
+            elif path.startswith("/x402/claim/"):
+                self._x402_claim(conn, path)
+            elif path in ("/x402/trust-feed.json", "/x402/trust-feed.ndjson"):
+                self._x402_trust_feed(conn, "ndjson" if path.endswith(".ndjson") else "json", limit)
             elif path in ("/agent.json", "/agents"):
                 self._agent_json(conn)
             elif path.startswith("/paid/requirements/"):
@@ -581,6 +634,9 @@ class Handler(BaseHTTPRequestHandler):
                 "x402_select_best": f"{base}/x402/best?q=web+search&max_price_usd=0.01&min_trust=80",
                 "x402_observed_trust_score": f"{base}/x402/trust/{{id-or-url}}",
                 "x402_leaderboard": f"{base}/x402/leaderboard?q=search",
+                "x402_trust_feed": f"{base}/x402/trust-feed.json (also .ndjson) — ingest into a catalog",
+                "x402_badge": f"{base}/badge/x402/{{id}}.svg — sellers: display your trust; "
+                              f"get the snippet at {base}/x402/claim/{{id}}",
                 "x402_registry_changes": f"{base}/x402/changes?type=payto_changed",
                 "x402_registry_search": f"{base}/x402/resources?q=search",
                 "x402_sample": f"{base}/x402/sample-change",
@@ -685,6 +741,9 @@ class Handler(BaseHTTPRequestHandler):
                 "prices": prices,
                 "first_seen": r["first_seen"], "last_seen": r["last_seen"],
                 "events": f"{base}/x402/changes",
+                "trust_url": f"{base}/x402/trust/{r['id']}",
+                "badge_url": f"{base}/badge/x402/{r['id']}.svg",
+                "claim_badge": f"{base}/x402/claim/{r['id']}",
                 "paid_history": f"{base}/paid/x402/history/{r['id']}",
             })
         total = conn.execute("SELECT COUNT(*) n FROM x402_resources").fetchone()["n"]
@@ -986,6 +1045,183 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    # ---- verifiedバッジ(#3: 売り手に自分でTrustを宣伝してもらう) ----
+
+    _GRADE_COLOR = {"A": "#4c1", "B": "#97ca00", "C": "#dfb317",
+                    "D": "#fe7d37", "F": "#e05d44"}
+
+    def _badge_fields(self, conn, row):
+        """バッジ表示用フィールド(shields.io互換 + リッチ情報)を組み立てる"""
+        from . import x402trust, attest
+        base = self._base_url()
+        label = "x402 trust"
+        if row is None or not _row_get(row, "trust_score"):
+            return {"schemaVersion": 1, "label": label, "message": "unrated",
+                    "color": "#9f9f9f", "verdict": "unrated", "grade": None,
+                    "trust_score": None, "payto_status": "unknown",
+                    "attested": False, "last_verified_at": None,
+                    "attestation_root": None,
+                    "resource": (row["resource"] if row else None),
+                    "detail_url": (f"{base}/x402/trust/{row['id']}" if row else None)}
+        trust = json.loads(row["trust_json"]) if row["trust_json"] else {}
+        v = trust.get("verdicts", {}) or {}
+        score = row["trust_score"]
+        grade = trust.get("grade")
+        # 署名付きアテステーションの有無
+        attested, root_hash = False, None
+        try:
+            lr = attest.latest_root(conn)
+            if lr is not None and conn.execute(
+                    "SELECT 1 FROM daily_leaves WHERE date=? AND resource_id=?",
+                    (lr["date"], row["id"])).fetchone() is not None:
+                attested, root_hash = True, lr["root_hash"]
+        except Exception:
+            pass
+        payto_status = ("live_mismatch" if v.get("payto_risk") == "live_mismatch"
+                        else "changed_recently" if v.get("payto_risk") == "changed_recently"
+                        else "stable")
+        if v.get("payto_risk") == "live_mismatch":
+            message, color, verdict = "payTo mismatch", "#e05d44", "payto_mismatch"
+        else:
+            message = f"{grade} · {score:g}" + (" ✓" if attested else "")
+            color = self._GRADE_COLOR.get(grade, "#9f9f9f")
+            verdict = ("verified_live" if v.get("verified_live") else "observed")
+        return {"schemaVersion": 1, "label": label, "message": message, "color": color,
+                "verdict": verdict, "grade": grade, "trust_score": score,
+                "payto_status": payto_status, "attested": attested,
+                "last_verified_at": trust.get("last_verified_at"),
+                "attestation_root": root_hash,
+                "resource": row["resource"],
+                "detail_url": f"{base}/x402/trust/{row['id']}"}
+
+    def _x402_badge(self, conn, path):
+        """GET /badge/x402/{id}.svg | .json — 売り手がREADME/サイトに貼れるバッジ"""
+        from . import x402watch, x402trust
+        conn.executescript(x402watch.SCHEMA_SQL)
+        x402trust._migrate(conn)
+        rest = path[len("/badge/x402/"):]
+        fmt = "svg"
+        if rest.endswith(".json"):
+            ident, fmt = rest[:-5], "json"
+        elif rest.endswith(".svg"):
+            ident, fmt = rest[:-4], "svg"
+        else:
+            ident = rest
+        ident = urllib.parse.unquote(ident)
+        row = self._x402_find(conn, ident)
+        f = self._badge_fields(conn, row)
+        if fmt == "json":
+            body = json.dumps(f, ensure_ascii=False).encode("utf-8")
+            # shields.io endpoint 互換 + 独自フィールド。CDN/camoで再取得されるので短めキャッシュ
+            self._raw_cached(body, "application/json; charset=utf-8", 1800)
+        else:
+            svg = _svg_badge(f["label"], f["message"], f["color"])
+            self._raw_cached(svg.encode("utf-8"), "image/svg+xml; charset=utf-8", 1800)
+
+    def _x402_claim(self, conn, path):
+        """GET /x402/claim/{id} — 売り手向け: 自分のバッジの貼り付けスニペットを返す"""
+        from . import x402watch, x402trust
+        conn.executescript(x402watch.SCHEMA_SQL)
+        x402trust._migrate(conn)
+        base = self._base_url()
+        ident = urllib.parse.unquote(path[len("/x402/claim/"):])
+        row = self._x402_find(conn, ident)
+        if row is None:
+            self._json({"error": "not_found",
+                        "hint": f"Find your resource id for free at {base}/x402/resources?q=..."},
+                       404)
+            return
+        rid = row["id"]
+        f = self._badge_fields(conn, row)
+        svg = f"{base}/badge/x402/{rid}.svg"
+        detail = f"{base}/x402/trust/{rid}"
+        self._json({
+            "service": "x402 Trust Index — badge for sellers",
+            "resource": row["resource"], "id": rid,
+            "current": {"grade": f["grade"], "observed_trust_score": f["trust_score"],
+                        "verdict": f["verdict"], "payto_status": f["payto_status"],
+                        "attested": f["attested"]},
+            "disclaimer": x402trust.SCORE_DISCLAIMER,
+            "badge_svg": svg,
+            "badge_json": f"{base}/badge/x402/{rid}.json",
+            "snippets": {
+                "markdown": f"[![x402 trust]({svg})]({detail})",
+                "html": f'<a href="{detail}"><img src="{svg}" alt="x402 trust"></a>',
+                "shields_endpoint":
+                    f"https://img.shields.io/endpoint?url={base}/badge/x402/{rid}.json",
+            },
+            "note": "Displays your OBSERVED trust score (payTo/price consistency, liveness, "
+                    "age, spam-farm) with a link to signed evidence. It updates automatically "
+                    "as we keep observing. Not a safety guarantee.",
+        })
+
+    def _x402_trust_feed(self, conn, fmt, limit):
+        """#2: 発見層(x402scan/Bazaar等)が取り込める公開Trustフィード"""
+        from . import x402watch, x402trust, attest
+        conn.executescript(x402watch.SCHEMA_SQL)
+        x402trust._migrate(conn)
+        base = self._base_url()
+        # カタログ取り込み用: 既定で全件(上限5000)。?limit= 明示時のみ絞る
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        try:
+            limit = min(int(q["limit"][0]), 5000) if q.get("limit") else 5000
+        except ValueError:
+            limit = 5000
+        try:
+            lr = attest.latest_root(conn)
+            root_hash = lr["root_hash"] if lr else None
+            root_date = lr["date"] if lr else None
+        except Exception:
+            root_hash = root_date = None
+        rows = conn.execute(
+            """SELECT * FROM x402_resources WHERE active=1 AND trust_score IS NOT NULL
+               ORDER BY trust_score DESC, id ASC LIMIT ?""", (limit,)).fetchall()
+
+        def rec(r):
+            trust = json.loads(r["trust_json"]) if r["trust_json"] else {}
+            v = trust.get("verdicts", {}) or {}
+            payto = ("live_mismatch" if v.get("payto_risk") == "live_mismatch"
+                     else "changed_recently" if v.get("payto_risk") == "changed_recently"
+                     else "stable")
+            return {
+                "resource": r["resource"],
+                "trust_score": r["trust_score"],
+                "grade": trust.get("grade"),
+                "verdict": ("payto_mismatch" if payto == "live_mismatch"
+                            else "verified" if v.get("verified_live") else "observed"),
+                "payto_status": payto,
+                "last_verified_at": trust.get("last_verified_at"),
+                "attestation_root": root_hash,
+                "badge_url": f"{base}/badge/x402/{r['id']}.svg",
+                "detail_url": f"{base}/x402/trust/{r['id']}",
+            }
+        if fmt == "ndjson":
+            lines = "\n".join(json.dumps(rec(r), ensure_ascii=False) for r in rows)
+            self._raw_cached((lines + "\n").encode("utf-8"),
+                             "application/x-ndjson; charset=utf-8", 900)
+        else:
+            body = json.dumps({
+                "service": "x402 Trust Index feed (kkj-watch)",
+                "score_type": "observed_trust_score",
+                "disclaimer": x402trust.SCORE_DISCLAIMER,
+                "generated_from_root": {"date": root_date, "root_hash": root_hash},
+                "count": len(rows),
+                "items": [rec(r) for r in rows],
+                "docs": f"{base}/llms.txt",
+            }, ensure_ascii=False, indent=1).encode("utf-8")
+            self._raw_cached(body, "application/json; charset=utf-8", 900)
+
+    def _raw_cached(self, body, ctype, max_age):
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", f"public, max-age={max_age}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _x402_attestations(self, conn):
         """無料: 最新の署名付き日次rootの公開情報(検証手順込み)"""
@@ -1711,7 +1947,11 @@ a{{color:#0a6}}</style></head><body>
                 return xff.split(",")[0].strip()
         return ip
 
-    def _identify(self, conn):
+    # 公開埋め込み(バッジ・feed・claim)は無償ティア上限の対象外。README等に貼られた
+    # バッジがGitHub camo経由で集中アクセスされても壊れないようにする
+    _NO_LIMIT_PREFIXES = ("/badge/", "/x402/trust-feed", "/x402/claim")
+
+    def _identify(self, conn, path=""):
         """APIキー検証+無償ティアの日次上限。戻り値: (client識別子, エラー or None)"""
         from . import billing
         api_key = self.headers.get("X-API-Key", "")
@@ -1721,6 +1961,8 @@ a{{color:#0a6}}</style></head><body>
                 return None, (401, {"error": "invalid_api_key"})
             return f"key:{rec['name']}", None
         ip = self._client_ip()
+        if any(path.startswith(p) for p in self._NO_LIMIT_PREFIXES):
+            return ip, None
         if ip not in ("127.0.0.1", "::1") and billing.over_free_limit(conn, ip):
             return None, (429, {"error": "free_tier_daily_limit",
                                 "hint": "X-API-Key ヘッダで有償キーを指定してください"})
