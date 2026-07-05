@@ -1,0 +1,9 @@
+[Unit]
+Description=kkj-watch x402 Trust Index probe (GET-only liveness+consistency of Bazaar-listed resources)
+
+[Service]
+Type=oneshot
+User=kkj
+WorkingDirectory=/opt/kkj-watch
+EnvironmentFile=/etc/kkj-watch.env
+ExecStart=/usr/bin/python3 -m kkj.x402probe run 400

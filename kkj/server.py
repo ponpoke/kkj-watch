@@ -25,19 +25,32 @@ LLMS_TXT = """# kkj-watch — change detection for machines
 > 2. JAPANESE PROCUREMENT WATCH — corrections, deadline changes, requirement changes and document
 >    replacements in Japanese government tenders (kkj.go.jp), with before/after, impact tags and quotes.
 
-## x402 registry watch (free feed)
+## x402 Trust Index (free)
 
-- GET /x402/changes : recent registry change events (price_changed | payto_changed | accepts_changed |
-  schema_changed | description_changed | new_resource | delisted | relisted)
-- GET /x402/changes?type=payto_changed : receiving-address changes (possible wallet rotation/hijack —
-  verify before paying). ?severity=critical works too.
+The Bazaar registry has 23,000+ listings; many are dead tests, spam farms, or inconsistent with what
+the live endpoint actually serves. The Trust Index scores every listed resource 0-100 with a
+deterministic, versioned, fully-explained formula (no LLM): liveness (GET-only live probes),
+listing-vs-live consistency (price and payTo served by the real endpoint vs the registry),
+payTo stability (a changed receiving address is a hijack signal the 402 flow will NOT catch —
+it pays the new address blindly), listing age/stability, and spam-farm detection
+(one payTo behind dozens of listings).
+
+- GET /x402/trust/{id-or-url} : trust score + grade (A-F) + verdicts + every deduction reason
+- GET /x402/leaderboard : top-scored verified resources (use to CHOOSE which endpoint to pay)
+- GET /x402/changes : change feed (price_changed | payto_changed | live_payto_mismatch |
+  endpoint_dead | schema_changed | delisted ...). ?type= and ?severity=critical filters.
 - GET /x402/resources?q=search : search the monitored registry inventory (returns resource ids)
-- GET /x402/sample-change : one representative event, so an agent can see the data shape before buying
-- GET /paid/x402/history/{id} : PAID $0.01 via x402 — full audit trail for one resource:
-  every snapshot (SHA-256) and every change event since monitoring began.
+- GET /x402/sample-change : one representative event (data shape preview)
 
-Why agents use it: if you cache an endpoint's 402 payment requirements, a silent price or payTo change
-makes your next payment fail — or pay the wrong address. This feed is the cheap check.
+## x402 Trust Index (paid, x402 USDC on Base)
+
+- GET /paid/x402/report/{id} : $0.02 — the full due-diligence dossier: trust score with evidence,
+  every registry snapshot (SHA-256 audit trail), every change event, every live-probe result.
+- GET /paid/x402/history/{id} : $0.01 — snapshot + change-event history only.
+
+Why this exists: the x402 protocol re-fetches payment terms at 402 time, so it happily pays a
+hijacked payTo or a silently-10x'd price. Only history + independent live verification catches that.
+Probes are GET-only, never pay, never follow redirects, and only target Bazaar-listed resources.
 
 ## Japanese procurement watch (free feed)
 
@@ -67,8 +80,10 @@ get_tender_change_evidence (free, full evidence) / get_cached_tender_requirement
 
 ## When to use what
 
-- About to pay an x402 endpoint you saw before? -> GET /x402/changes?type=price_changed (free).
-- Need the full audit trail of one x402 resource? -> GET /paid/x402/history/{id} ($0.01).
+- Choosing which x402 endpoint to pay? -> GET /x402/leaderboard (free).
+- About to pay a specific endpoint? -> GET /x402/trust/{id-or-url} (free) — check payto_risk first.
+- Need the full due-diligence dossier? -> GET /paid/x402/report/{id} ($0.02).
+- Need raw snapshot/event history only? -> GET /paid/x402/history/{id} ($0.01).
 - Just want the procurement change feed? -> GET /events (free). Filter with ?tag=.
 - Need to know if you qualify / what to submit? -> GET /paid/requirements/{key} (cached, $0.02).
 - No cached data yet for that tender? -> GET /paid/analyze-now/{key} ($0.30, runs extraction).
@@ -178,7 +193,8 @@ def classify_usage(path, user_agent, query_has_filter):
     ua = user_agent or ""
     if path.startswith("/paid/"):
         return "paid_intent"
-    is_data = (path in _FREE_DATA_PATHS or path.startswith("/cases"))
+    is_data = (path in _FREE_DATA_PATHS or path.startswith("/cases")
+               or path.startswith("/x402/"))
     if is_data:
         # プローバUAでも、タグ/クエリ付きの具体的な取得は「使っている」と見なす
         if _PROBE_UA.search(ua) and not query_has_filter:
@@ -300,8 +316,9 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 try:
-                    from . import x402watch
+                    from . import x402watch, x402probe
                     out["x402_registry"] = x402watch.stats(conn)
+                    out["x402_probes"] = x402probe.stats(conn)
                 except Exception:
                     pass
                 self._json(out)
@@ -348,8 +365,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._x402_resources(conn, limit, (qs.get("q") or [""])[0])
             elif path == "/x402/sample-change":
                 self._x402_sample(conn)
+            elif path.startswith("/x402/trust/"):
+                self._x402_trust(conn, path)
+            elif path == "/x402/leaderboard":
+                self._x402_leaderboard(conn, limit)
             elif path.startswith("/paid/x402/history/"):
                 self._paid_x402_history(conn, path)
+            elif path.startswith("/paid/x402/report/"):
+                self._paid_x402_report(conn, path)
             elif path in ("/agent.json", "/agents"):
                 self._agent_json(conn)
             elif path.startswith("/paid/requirements/"):
@@ -520,14 +543,17 @@ class Handler(BaseHTTPRequestHandler):
                 "tender_search": f"{base}/cases?query=cloud",
                 "sample": f"{base}/sample-diff",
                 "evidence_page": f"{base}/case/{{key}}",
-                "x402_registry_changes": f"{base}/x402/changes?type=price_changed",
+                "x402_trust_score": f"{base}/x402/trust/{{id-or-url}}",
+                "x402_trust_leaderboard": f"{base}/x402/leaderboard",
+                "x402_registry_changes": f"{base}/x402/changes?type=payto_changed",
                 "x402_registry_search": f"{base}/x402/resources?q=search",
                 "x402_sample": f"{base}/x402/sample-change",
             },
             "paid_endpoints": {
                 "cached_requirements": f"{base}/paid/requirements/{{key}} ($0.02, x402 USDC on Base)",
                 "on_demand_analysis": f"{base}/paid/analyze-now/{{key}} ($0.30, runs LLM extraction)",
-                "x402_resource_history": f"{base}/paid/x402/history/{{id}} ($0.01, full audit trail)",
+                "x402_trust_report": f"{base}/paid/x402/report/{{id}} ($0.02, full due-diligence dossier)",
+                "x402_resource_history": f"{base}/paid/x402/history/{{id}} ($0.01, history only)",
             },
             "impact_tags": ["deadline_affecting", "eligibility_affecting", "price_affecting",
                             "document_affecting", "qa_related", "cancellation", "postponement"],
@@ -678,6 +704,140 @@ class Handler(BaseHTTPRequestHandler):
             "docs": f"{base}/llms.txt",
         })
 
+    def _x402_find(self, conn, ident):
+        """id(数値) または resource URL で1リソースを引く"""
+        if ident.isdigit():
+            return conn.execute("SELECT * FROM x402_resources WHERE id=?",
+                                (int(ident),)).fetchone()
+        return conn.execute("SELECT * FROM x402_resources WHERE resource=?",
+                            (ident,)).fetchone()
+
+    def _x402_trust(self, conn, path):
+        """無料: Trust Index — 1リソースの格付け(スコア+verdict+減点根拠)"""
+        from . import x402watch, x402trust
+        conn.executescript(x402watch.SCHEMA_SQL)
+        ident = urllib.parse.unquote(path[len("/x402/trust/"):])
+        row = self._x402_find(conn, ident)
+        base = self._base_url()
+        if row is None:
+            self._json({"error": "not_found",
+                        "hint": f"Find resources for free: {base}/x402/resources?q=..."}, 404)
+            return
+        trust = x402trust.get_or_compute(conn, row)
+        conn.commit()
+        self._json({
+            "service": "x402 Trust Index (kkj-watch)",
+            "resource": row["resource"], "service_name": row["service_name"],
+            "id": row["id"],
+            "trust": trust,
+            "how_scored": "Deterministic, versioned formula over registry history "
+                          "(hourly Bazaar sync since 2026-07) and live GET-only probes. "
+                          "All deductions are listed in trust.reasons — verify them yourself.",
+            "full_evidence": f"{base}/paid/x402/report/{row['id']} ($0.02, x402): trust + "
+                             "full snapshot history + all probe results.",
+            "free_feed": f"{base}/x402/changes",
+        })
+
+    def _x402_leaderboard(self, conn, limit):
+        """無料: 検証済みリソースの格付け上位(エージェントのサービス選定用)"""
+        from . import x402watch, x402trust
+        conn.executescript(x402watch.SCHEMA_SQL)
+        x402trust._migrate(conn)
+        base = self._base_url()
+        limit = min(limit, 100)
+        rows = conn.execute(
+            """SELECT * FROM x402_resources WHERE active=1 AND trust_score IS NOT NULL
+               ORDER BY trust_score DESC, id ASC LIMIT ?""", (limit,)).fetchall()
+        items = []
+        for r in rows:
+            t = json.loads(r["trust_json"]) if r["trust_json"] else {}
+            rec = json.loads(r["latest_json"])
+            prices = []
+            for a in rec.get("accepts", []):
+                usd = x402watch.usd_of(a.get("amount"), a.get("asset"))
+                prices.append({"network": a.get("network"), "amount": a.get("amount"),
+                               **({"usd": usd} if usd is not None else {})})
+            items.append({
+                "id": r["id"], "resource": r["resource"], "service_name": r["service_name"],
+                "score": r["trust_score"], "grade": t.get("grade"),
+                "verdicts": t.get("verdicts"), "prices": prices,
+                "last_verified_at": t.get("last_verified_at"),
+                "trust_detail": f"{base}/x402/trust/{r['id']}",
+            })
+        scored = conn.execute(
+            "SELECT COUNT(*) n FROM x402_resources WHERE trust_score IS NOT NULL").fetchone()["n"]
+        self._json({
+            "service": "x402 Trust Index (kkj-watch)",
+            "description": "Bazaar-listed x402 resources ranked by trust score (0-100): "
+                           "liveness, listing-vs-live consistency, payTo stability, age, "
+                           "spam-farm detection. Use before choosing which endpoint to pay.",
+            "scored_resources": scored,
+            "count": len(items), "items": items,
+            "check_any": f"{base}/x402/trust/{{id-or-url}}",
+        })
+
+    def _x402_report_payload(self, conn, row):
+        """完全調書: trust + 全履歴 + 全プローブ"""
+        from . import x402trust, x402probe
+        conn.executescript(x402probe.SCHEMA_SQL)
+        payload = self._x402_history_payload(conn, row)
+        payload["trust"] = x402trust.get_or_compute(conn, row)
+        payload["probes"] = [
+            {"probed_at": p["probed_at"], "alive": bool(p["alive"]),
+             "http_status": p["http_status"], "is_402": bool(p["is_402"]),
+             "latency_ms": p["latency_ms"], "consistency": p["consistency"],
+             "live_accepts": json.loads(p["live_accepts_json"]) if p["live_accepts_json"] else None,
+             "error": p["error"]}
+            for p in conn.execute(
+                "SELECT * FROM x402_probes WHERE resource_id=? ORDER BY id",
+                (row["id"],)).fetchall()]
+        return payload
+
+    def _paid_x402_report(self, conn, path):
+        """有料($0.02): Trust調書 — 格付け+全スナップショット履歴+全プローブ結果"""
+        from . import x402_gate, x402watch, paid
+        conn.executescript(x402watch.SCHEMA_SQL)
+        ident = urllib.parse.unquote(path[len("/paid/x402/report/"):])
+        if not x402_gate.available():
+            self._json({"error": "payments_not_configured"}, 503)
+            return
+        row = self._x402_find(conn, ident)
+        base = self._base_url()
+        if row is None:
+            self._json({"error": "not_found", "hint": f"Find resource ids for free at "
+                        f"{base}/x402/resources?q=..."}, 404)
+            return
+        resource = f"{base}{path}"
+        reqs = x402_gate.payment_requirements(
+            resource,
+            "x402 Trust Index dossier for one Bazaar resource: trust score with full scoring "
+            "evidence, every registry snapshot (SHA-256 audit trail), every change event "
+            "(price/payTo/schema/listing) and every live-probe result. The complete due-"
+            f"diligence bundle before paying an endpoint. Free preview: {base}/x402/trust/{{id}}",
+            output_schema={"input": {"type": "http", "method": "GET"}},
+            price_usd=0.02,
+        )
+        job = self._settle_and_claim(conn, reqs, resource, f"x402r:{row['id']}",
+                                     free_hint=self._x402_free_hint())
+        if job is None:
+            return
+        if job["status"] == "succeeded" and job["result_json"]:
+            self._json({"cached": True, "report": json.loads(job["result_json"]),
+                        "retry_token": job["retry_token"]})
+            return
+        payload = self._x402_report_payload(conn, row)
+        paid.finish(conn, job["retry_token"], "succeeded", payload)
+        body = json.dumps({"cached": False, "report": payload,
+                           "retry_token": job["retry_token"]},
+                          ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if job["settlement"]:
+            self.send_header("X-PAYMENT-RESPONSE", job["settlement"])
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _x402_history_payload(self, conn, row):
         """1リソースの全履歴(スナップショット+イベント)を組み立てる"""
         return {
@@ -781,6 +941,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/x402/changes": op("x402 Bazaar registry change events (free)",
                                     ["type", "severity", "limit"]),
                 "/x402/resources": op("Search the monitored x402 registry (free)", ["q", "limit"]),
+                "/x402/trust/{id}": op("Trust score 0-100 + verdicts for one x402 resource (free)"),
+                "/x402/leaderboard": op("Top-scored verified x402 resources (free)", ["limit"]),
                 "/x402/sample-change": op("Sample registry change event (free)"),
                 "/paid/requirements/{key}": op(
                     "Structured bidding requirements, $0.02 via x402", paid=True),
@@ -789,6 +951,8 @@ class Handler(BaseHTTPRequestHandler):
                 "/paid/x402/history/{id}": op(
                     "Full snapshot+event history for one x402 resource, $0.01 via x402",
                     paid=True),
+                "/paid/x402/report/{id}": op(
+                    "Trust dossier: score+evidence+history+probes, $0.02 via x402", paid=True),
             },
         })
 
@@ -811,12 +975,16 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": "procurement_changes",
                  "name": "Japanese procurement change feed",
                  "description": f"GET {base}/events?tag=deadline_affecting (free)"},
+                {"id": "x402_trust_index",
+                 "name": "x402 Trust Index",
+                 "description": f"GET {base}/x402/trust/{{id-or-url}} (free) — trust score 0-100 "
+                                "before paying any x402 endpoint"},
                 {"id": "x402_registry_changes",
                  "name": "x402 registry change feed",
-                 "description": f"GET {base}/x402/changes?type=price_changed (free)"},
-                {"id": "x402_resource_history",
-                 "name": "x402 resource audit history",
-                 "description": f"GET {base}/paid/x402/history/{{id}} ($0.01 via x402)"},
+                 "description": f"GET {base}/x402/changes?type=payto_changed (free)"},
+                {"id": "x402_trust_report",
+                 "name": "x402 trust dossier",
+                 "description": f"GET {base}/paid/x402/report/{{id}} ($0.02 via x402)"},
             ],
         })
 
@@ -864,6 +1032,22 @@ class Handler(BaseHTTPRequestHandler):
                 "type": "http", "method": "GET",
                 "x402Version": 1,
                 "accepts": [hist_reqs],
+                "lastUpdated": store.now_utc(),
+            })
+            report_reqs = x402_gate.payment_requirements(
+                f"{base}/paid/x402/report/1",
+                "x402 Trust Index dossier: trust score (liveness, listing-vs-live consistency, "
+                "payTo stability, spam-farm detection) with full evidence — every registry "
+                "snapshot, change event and live-probe result for one Bazaar resource. "
+                f"Free preview: {base}/x402/trust/{{id}} and {base}/x402/leaderboard",
+                output_schema={"input": {"type": "http", "method": "GET"}},
+                price_usd=0.02,
+            )
+            resources.append({
+                "resource": f"{base}/paid/x402/report/1",
+                "type": "http", "method": "GET",
+                "x402Version": 1,
+                "accepts": [report_reqs],
                 "lastUpdated": store.now_utc(),
             })
         self._json({
@@ -1127,18 +1311,21 @@ a{{color:#0a6}}</style></head><body>
                         "retry_token": token})
             return
         # 未完了 → 再実行(既に支払い済みなので課金しない)
-        if job["case_key"].startswith("x402:"):
-            # x402履歴ジョブ: LLM不要。履歴を再構築して完了させる
+        if job["case_key"].startswith(("x402:", "x402r:")):
+            # x402履歴/調書ジョブ: LLM不要。データを再構築して完了させる
             from . import x402watch, paid
             conn.executescript(x402watch.SCHEMA_SQL)
-            rid = int(job["case_key"][len("x402:"):])
+            is_report = job["case_key"].startswith("x402r:")
+            rid = int(job["case_key"].split(":", 1)[1])
             row = conn.execute("SELECT * FROM x402_resources WHERE id=?", (rid,)).fetchone()
             if row is None:
                 self._json({"error": "resource_gone", "retry_token": token}, 410)
                 return
-            payload = self._x402_history_payload(conn, row)
+            payload = (self._x402_report_payload(conn, row) if is_report
+                       else self._x402_history_payload(conn, row))
             paid.finish(conn, token, "succeeded", payload)
-            self._json({"cached": True, "history": payload, "retry_token": token})
+            self._json({"cached": True, ("report" if is_report else "history"): payload,
+                        "retry_token": token})
             return
         self._run_analysis_job(conn, token, job["case_key"], None)
 

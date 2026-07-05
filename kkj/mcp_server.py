@@ -14,6 +14,35 @@ PROTOCOL_VERSION = "2025-06-18"
 
 TOOLS = [
     {
+        "name": "check_x402_endpoint_trust",
+        "description": "Check the trust score (0-100, grade A-F) of an x402 Bazaar resource "
+                       "BEFORE paying it. Combines liveness probes, listing-vs-live consistency "
+                       "(does the real endpoint serve the same price and payTo as the registry?), "
+                       "payTo stability (a changed receiving address is a hijack signal the 402 "
+                       "flow pays blindly), listing age and spam-farm detection. Free, "
+                       "deterministic, all deduction reasons included.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "resource": {"type": "string",
+                             "description": "resource URL or numeric id (find via "
+                                            "/x402/resources?q= or list tools)"},
+            },
+            "required": ["resource"],
+        },
+    },
+    {
+        "name": "list_x402_trusted_endpoints",
+        "description": "Ranked list of verified, trustworthy x402 resources (Trust Index "
+                       "leaderboard). Use to choose which paid endpoint to call. Free.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "max items (default 20)"},
+            },
+        },
+    },
+    {
         "name": "list_x402_registry_changes",
         "description": "List recent change events in the x402 Bazaar registry (23k+ paid API "
                        "resources): price_changed, payto_changed (receiving-address change — verify "
@@ -208,6 +237,47 @@ def tool_list_x402_changes(args):
     return out
 
 
+def tool_check_trust(args):
+    """1リソースのTrustスコア(無料)"""
+    from . import x402watch, x402trust
+    ident = str(args.get("resource", "")).strip()
+    conn = store.connect()
+    conn.executescript(x402watch.SCHEMA_SQL)
+    if ident.isdigit():
+        row = conn.execute("SELECT * FROM x402_resources WHERE id=?", (int(ident),)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM x402_resources WHERE resource=?", (ident,)).fetchone()
+    if row is None:
+        conn.close()
+        return {"error": "not_found",
+                "hint": "Search resources with list_x402_registry_changes or /x402/resources?q="}
+    trust = x402trust.get_or_compute(conn, row)
+    conn.commit()
+    out = {"resource": row["resource"], "service_name": row["service_name"],
+           "id": row["id"], "trust": trust}
+    conn.close()
+    return out
+
+
+def tool_trust_leaderboard(args):
+    """Trustスコア上位(無料)"""
+    from . import x402watch, x402trust
+    limit = min(int(args.get("limit", 20)), 100)
+    conn = store.connect()
+    conn.executescript(x402watch.SCHEMA_SQL)
+    x402trust._migrate(conn)
+    out = []
+    for r in conn.execute(
+            """SELECT * FROM x402_resources WHERE active=1 AND trust_score IS NOT NULL
+               ORDER BY trust_score DESC, id ASC LIMIT ?""", (limit,)).fetchall():
+        t = json.loads(r["trust_json"]) if r["trust_json"] else {}
+        out.append({"id": r["id"], "resource": r["resource"],
+                    "service_name": r["service_name"], "score": r["trust_score"],
+                    "grade": t.get("grade"), "verdicts": t.get("verdicts")})
+    conn.close()
+    return out
+
+
 def tool_get_requirements(args):
     """キャッシュ済み構造化要件を返す。未抽出は有料オンデマンド解析へ誘導(裏でLLMを呼ばない=コスト制御)"""
     conn = store.connect()
@@ -222,6 +292,8 @@ def tool_get_requirements(args):
 
 HANDLERS = {
     # 目的ベースの新名(外部エージェント向け)
+    "check_x402_endpoint_trust": tool_check_trust,
+    "list_x402_trusted_endpoints": tool_trust_leaderboard,
     "list_x402_registry_changes": tool_list_x402_changes,
     "find_tender_deadline_changes": tool_search_cases,
     "get_tender_change_evidence": tool_get_case,
