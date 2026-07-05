@@ -1,0 +1,9 @@
+[Unit]
+Description=Generate the daily signed hash-chain root once per day (UTC)
+
+[Timer]
+OnCalendar=*-*-* 23:55:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

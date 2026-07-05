@@ -110,10 +110,13 @@ def compute(conn, row):
     if price_ev:
         reasons.append(f"{price_ev} price changes in 30d")
 
-    # liveness (25) + consistency (20): 最新プローブから
-    probe = conn.execute(
-        "SELECT * FROM x402_probes WHERE resource_id=? ORDER BY id DESC LIMIT 1",
-        (rid,)).fetchone()
+    # liveness (25) + consistency (20): 最新プローブから(未プローブ・テーブル未作成にも耐える)
+    try:
+        probe = conn.execute(
+            "SELECT * FROM x402_probes WHERE resource_id=? ORDER BY id DESC LIMIT 1",
+            (rid,)).fetchone()
+    except Exception:
+        probe = None
     verified_live = False
     last_verified = None
     if probe is None:

@@ -1,0 +1,22 @@
+{
+ "algo": "Ed25519",
+ "chain_index": 0,
+ "created_at": "2026-07-05T09:40:12.142913+00:00",
+ "date": "2026-07-05",
+ "format_version": 1,
+ "merkle_root": "6b233d493139c589bf9224a27b36a4690765c295b4ef27b72c17ae9d8f4f2244",
+ "previous_root": null,
+ "public_key": "gmcg87hSMucI/fRY2GJ5IeTlgYI377G0AEeNkD1uHmY=",
+ "record": "daily signed hash-chain root of observed x402 registry records",
+ "records_count": 23278,
+ "root_hash": "500db2f9729e3b77f196aadd7623f6934f3c470826101e1bcfeb168c72521526",
+ "service": "kkj-watch x402 Trust Index",
+ "signature": "uS0Jt2Bu9Wv3eQSYTlqSAx9ofSrjygAmjnZZ79IioSb50G+tg5yz8TzujlW1HHMur1YiKrXm1esNBjA6/yXjAA==",
+ "verify": {
+  "chain": "this.previous_root == prior day's root_hash",
+  "cli": "python -m kkj.attest verify-root 2026-07-05",
+  "merkle": "leaf=sha256(canonical(record)); node=sha256(left||right); duplicate last if odd",
+  "root_hash": "sha256(canonical({date,previous_root,records_count,merkle_root,created_at}))",
+  "signature": "Ed25519.verify(public_key, signature, utf8(root_hash))"
+ }
+}

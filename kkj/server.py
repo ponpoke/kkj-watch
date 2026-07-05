@@ -25,13 +25,19 @@ LLMS_TXT = """# kkj-watch — change detection for machines
 > 2. JAPANESE PROCUREMENT WATCH — corrections, deadline changes, requirement changes and document
 >    replacements in Japanese government tenders (kkj.go.jp), with before/after, impact tags and quotes.
 
-## x402 Trust Index (free) — an OBSERVED, evidence-based risk score (not a guarantee)
+## x402 Trust Index (free) — an OBSERVED trust score, backed by daily signed hash-chain roots
 
 The Bazaar registry has 23,000+ listings; many are dead tests, spam farms, or inconsistent with what
 the live endpoint actually serves. The Trust Index assigns each listed resource an *observed trust
 score* 0-100 with a deterministic, versioned, fully-explained formula (no LLM). It is a RISK
 INDICATOR based on past observations, listing-vs-live consistency, and live GET-only probes —
-NOT a safety guarantee. Signals: liveness (GET-only probes), listing-vs-live consistency (price
+NOT a safety guarantee. Every observation is committed to a **daily Ed25519-signed Merkle root,
+hash-chained to the previous day** (tamper-evident; roots published for independent verification),
+so the score is backed by a record you can prove was not back-dated.
+
+- GET /x402/attestations : latest signed daily hash-chain root (free) + verify steps
+- GET /paid/x402/attest/{id} : $0.02 — signed inclusion proof that a resource's observed record is
+  committed to that day's root (evidence you can show a third party / keep in a decision log) Signals: liveness (GET-only probes), listing-vs-live consistency (price
 and payTo served by the real endpoint vs the registry), payTo stability (a changed receiving
 address is a hijack signal the 402 flow will NOT catch — it pays the new address blindly),
 listing age/stability, and spam-farm detection (one payTo behind dozens of listings).
@@ -89,10 +95,12 @@ get_tender_change_evidence (free, full evidence) / get_cached_tender_requirement
 - Browse the ranking? -> GET /x402/leaderboard?q=X (free).
 - About to pay a specific endpoint? -> GET /x402/trust/{id-or-url} (free) — check payto_risk first.
 - Need the full due-diligence dossier? -> GET /paid/x402/report/{id} ($0.02).
+- Need signed, tamper-evident evidence for a dispute/log? -> GET /paid/x402/attest/{id} ($0.02).
 - Need raw snapshot/event history only? -> GET /paid/x402/history/{id} ($0.01).
 
 The score is an observed, evidence-based risk indicator, not a safety guarantee. Always verify
-payment terms before paying.
+payment terms before paying. Observations are backed by daily Ed25519-signed hash-chain roots
+(GET /x402/attestations) so the record is provably not back-dated.
 - Just want the procurement change feed? -> GET /events (free). Filter with ?tag=.
 - Need to know if you qualify / what to submit? -> GET /paid/requirements/{key} (cached, $0.02).
 - No cached data yet for that tender? -> GET /paid/analyze-now/{key} ($0.30, runs extraction).
@@ -194,7 +202,8 @@ _PROBE_UA = _re.compile(
     _re.I)
 # 実データを取得する無料エンドポイント(意図ある利用)
 _FREE_DATA_PATHS = ("/events", "/sample-diff",
-                    "/x402/changes", "/x402/resources", "/x402/sample-change")
+                    "/x402/changes", "/x402/resources", "/x402/sample-change",
+                    "/x402/attestations")
 
 
 def classify_usage(path, user_agent, query_has_filter):
@@ -325,9 +334,10 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 try:
-                    from . import x402watch, x402probe
+                    from . import x402watch, x402probe, attest
                     out["x402_registry"] = x402watch.stats(conn)
                     out["x402_probes"] = x402probe.stats(conn)
+                    out["attestations"] = attest.stats(conn)
                 except Exception:
                     pass
                 self._json(out)
@@ -385,6 +395,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._paid_x402_history(conn, path)
             elif path.startswith("/paid/x402/report/"):
                 self._paid_x402_report(conn, path)
+            elif path.startswith("/paid/x402/attest/"):
+                self._paid_x402_attest(conn, path)
+            elif path == "/x402/attestations":
+                self._x402_attestations(conn)
             elif path in ("/agent.json", "/agents"):
                 self._agent_json(conn)
             elif path.startswith("/paid/requirements/"):
@@ -738,6 +752,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         trust = x402trust.get_or_compute(conn, row)
         conn.commit()
+        # free preview: 最新の署名付きアテステーションが利用可能か(要件11)
+        latest_attestation = None
+        try:
+            from . import attest
+            lr = attest.latest_root(conn)
+            if lr is not None:
+                in_root = conn.execute(
+                    "SELECT 1 FROM daily_leaves WHERE date=? AND resource_id=?",
+                    (lr["date"], row["id"])).fetchone() is not None
+                latest_attestation = {
+                    "available": in_root,
+                    "date": lr["date"],
+                    "root_hash": lr["root_hash"],
+                    "algo": lr["algo"],
+                    "public_key": lr["public_key"],
+                    "paid_endpoint": f"{base}/paid/x402/attest/{row['id']} ($0.02, x402): "
+                                     "signed inclusion proof + daily hash-chain root",
+                    "public_root": f"{base}/x402/attestations",
+                }
+        except Exception:
+            pass
         self._json({
             "service": "x402 Trust Index (kkj-watch)",
             "resource": row["resource"], "service_name": row["service_name"],
@@ -746,6 +781,7 @@ class Handler(BaseHTTPRequestHandler):
             "disclaimer": x402trust.SCORE_DISCLAIMER,
             "observed_trust_score": trust.get("score"),
             "trust": trust,
+            "latest_attestation_available": latest_attestation,
             "how_scored": "Deterministic, versioned formula over observed registry history "
                           "(hourly Bazaar sync since 2026-07) and live GET-only probes. "
                           "All deductions are listed in trust.reasons — verify them yourself. "
@@ -942,6 +978,121 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _x402_attestations(self, conn):
+        """無料: 最新の署名付き日次rootの公開情報(検証手順込み)"""
+        from . import attest
+        base = self._base_url()
+        r = attest.latest_root(conn)
+        if r is None:
+            self._json({"service": "kkj-watch x402 Trust Index attestations",
+                        "available": False,
+                        "note": "No daily root has been generated yet."})
+            return
+        doc = attest._public_doc(r)
+        doc["how_to_get_resource_proof"] = (
+            f"{base}/paid/x402/attest/{{resource_id}} ($0.02, x402): "
+            "signed Merkle inclusion proof that a resource's observed record is committed "
+            "to this day's root.")
+        doc["chain"] = ("Each daily root includes previous_root = prior day's root_hash, "
+                        "forming a tamper-evident hash chain. Roots are also published to "
+                        "GitHub for independent, time-stamped verification.")
+        self._json(doc)
+
+    def _paid_x402_attest(self, conn, path):
+        """有料($0.02): 署名付きアテステーション(要件10)。
+        resourceの観測記録・trust score・inclusion proof・daily root・署名・検証手順を返す。"""
+        from . import x402_gate, x402watch, attest, paid
+        conn.executescript(x402watch.SCHEMA_SQL)
+        ident = urllib.parse.unquote(path[len("/paid/x402/attest/"):])
+        if not x402_gate.available():
+            self._json({"error": "payments_not_configured"}, 503)
+            return
+        row = self._x402_find(conn, ident)
+        base = self._base_url()
+        # paid-but-denied防止: 対象なし→404
+        if row is None:
+            self._json({"error": "not_found", "hint": f"Find resource ids for free at "
+                        f"{base}/x402/resources?q=..."}, 404)
+            return
+        # paid-but-denied防止: まだ日次rootが無い / このresourceがrootに含まれていない→409(課金しない)
+        lr = attest.latest_root(conn)
+        if lr is None:
+            self._json({"error": "no_attestation_yet",
+                        "hint": "No daily signed root has been generated yet. No charge."}, 409)
+            return
+        in_root = conn.execute(
+            "SELECT 1 FROM daily_leaves WHERE date=? AND resource_id=?",
+            (lr["date"], row["id"])).fetchone() is not None
+        if not in_root:
+            self._json({"error": "not_in_latest_root",
+                        "hint": "This resource is not yet committed to a signed root. No charge.",
+                        "latest_root_date": lr["date"]}, 409)
+            return
+        resource = f"{base}{path}"
+        reqs = x402_gate.payment_requirements(
+            resource,
+            "Signed attestation for one x402 resource: its observed record, observed trust "
+            "score, a Merkle inclusion proof into that day's root, the daily hash-chain root "
+            "(previous_root linked) and an Ed25519 signature, plus independent verify steps. "
+            "Tamper-evident evidence of what was observed at a point in time. "
+            f"Free preview: {base}/x402/trust/{row['id']}",
+            output_schema={"input": {"type": "http", "method": "GET"}},
+            price_usd=0.02,
+        )
+        job = self._settle_and_claim(conn, reqs, resource, f"x402a:{row['id']}",
+                                     free_hint=self._x402_free_hint())
+        if job is None:
+            return
+        if job["status"] == "succeeded" and job["result_json"]:
+            self._json({"cached": True, "attestation": json.loads(job["result_json"]),
+                        "retry_token": job["retry_token"]})
+            return
+        payload = self._x402_attest_payload(conn, row, lr)
+        paid.finish(conn, job["retry_token"], "succeeded", payload)
+        body = json.dumps({"cached": False, "attestation": payload,
+                           "retry_token": job["retry_token"]},
+                          ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if job["settlement"]:
+            self.send_header("X-PAYMENT-RESPONSE", job["settlement"])
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _x402_attest_payload(self, conn, row, lr):
+        """アテステーション本体(要件10): 観測記録+trust+inclusion proof+root+署名+検証手順"""
+        from . import attest, x402trust
+        proof = attest.prove_resource(row["id"], lr["date"], conn=conn)
+        trust = x402trust.get_or_compute(conn, row)
+        conn.commit()
+        base = self._base_url()
+        return {
+            "service": "kkj-watch x402 Trust Index — signed attestation",
+            "disclaimer": x402trust.SCORE_DISCLAIMER,
+            "resource": row["resource"], "resource_id": row["id"],
+            "service_name": row["service_name"],
+            "observed_trust_score": trust.get("score"),
+            "trust": trust,
+            "observed_record": proof.get("record"),
+            "attestation": {
+                "date": lr["date"],
+                "leaf_hash": proof.get("leaf_hash"),
+                "leaf_index": proof.get("leaf_index"),
+                "inclusion_proof": proof.get("inclusion_proof"),
+                "merkle_root": lr["merkle_root"],
+                "previous_root": lr["previous_root"],
+                "root_hash": lr["root_hash"],
+                "records_count": lr["records_count"],
+                "algo": lr["algo"],
+                "public_key": lr["public_key"],
+                "signature": lr["signature"],
+            },
+            "verify_steps": proof.get("verify_steps"),
+            "public_root": f"{base}/x402/attestations",
+            "cli_verify": f"python -m kkj.attest prove-resource {row['id']} {lr['date']}",
+        }
+
     def _x402_history_payload(self, conn, row):
         """1リソースの全履歴(スナップショット+イベント)を組み立てる"""
         return {
@@ -1060,6 +1211,10 @@ class Handler(BaseHTTPRequestHandler):
                     paid=True),
                 "/paid/x402/report/{id}": op(
                     "Trust dossier: score+evidence+history+probes, $0.02 via x402", paid=True),
+                "/paid/x402/attest/{id}": op(
+                    "Signed attestation: inclusion proof + daily hash-chain root, $0.02 via x402",
+                    paid=True),
+                "/x402/attestations": op("Latest signed daily hash-chain root (free)"),
             },
         })
 
@@ -1159,6 +1314,22 @@ class Handler(BaseHTTPRequestHandler):
                 "type": "http", "method": "GET",
                 "x402Version": 1,
                 "accepts": [report_reqs],
+                "lastUpdated": store.now_utc(),
+            })
+            attest_reqs = x402_gate.payment_requirements(
+                f"{base}/paid/x402/attest/1",
+                "Signed attestation for one x402 resource: observed record + observed trust "
+                "score + Merkle inclusion proof into a daily Ed25519-signed hash-chain root "
+                "(linked to the previous day). Tamper-evident evidence of what was observed at "
+                f"a point in time. Free preview: {base}/x402/attestations",
+                output_schema={"input": {"type": "http", "method": "GET"}},
+                price_usd=0.02,
+            )
+            resources.append({
+                "resource": f"{base}/paid/x402/attest/1",
+                "type": "http", "method": "GET",
+                "x402Version": 1,
+                "accepts": [attest_reqs],
                 "lastUpdated": store.now_utc(),
             })
         self._json({
@@ -1422,21 +1593,32 @@ a{{color:#0a6}}</style></head><body>
                         "retry_token": token})
             return
         # 未完了 → 再実行(既に支払い済みなので課金しない)
-        if job["case_key"].startswith(("x402:", "x402r:")):
-            # x402履歴/調書ジョブ: LLM不要。データを再構築して完了させる
-            from . import x402watch, paid
+        if job["case_key"].startswith(("x402:", "x402r:", "x402a:")):
+            # x402履歴/調書/アテステーションジョブ: LLM不要。データを再構築して完了させる
+            from . import x402watch, attest, paid
             conn.executescript(x402watch.SCHEMA_SQL)
-            is_report = job["case_key"].startswith("x402r:")
+            kind = ("attest" if job["case_key"].startswith("x402a:") else
+                    "report" if job["case_key"].startswith("x402r:") else "history")
             rid = int(job["case_key"].split(":", 1)[1])
             row = conn.execute("SELECT * FROM x402_resources WHERE id=?", (rid,)).fetchone()
             if row is None:
                 self._json({"error": "resource_gone", "retry_token": token}, 410)
                 return
-            payload = (self._x402_report_payload(conn, row) if is_report
-                       else self._x402_history_payload(conn, row))
+            if kind == "attest":
+                lr = attest.latest_root(conn)
+                if lr is None:
+                    self._json({"error": "no_attestation_yet", "retry_token": token}, 409)
+                    return
+                payload = self._x402_attest_payload(conn, row, lr)
+                key = "attestation"
+            elif kind == "report":
+                payload = self._x402_report_payload(conn, row)
+                key = "report"
+            else:
+                payload = self._x402_history_payload(conn, row)
+                key = "history"
             paid.finish(conn, token, "succeeded", payload)
-            self._json({"cached": True, ("report" if is_report else "history"): payload,
-                        "retry_token": token})
+            self._json({"cached": True, key: payload, "retry_token": token})
             return
         self._run_analysis_job(conn, token, job["case_key"], None)
 
