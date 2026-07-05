@@ -1,0 +1,9 @@
+[Unit]
+Description=kkj-watch Japanese resource directory sync (GET-only, low-frequency)
+
+[Service]
+Type=oneshot
+User=kkj
+WorkingDirectory=/opt/kkj-watch
+EnvironmentFile=/etc/kkj-watch.env
+ExecStart=/usr/bin/python3 -m kkj.jpdir sync

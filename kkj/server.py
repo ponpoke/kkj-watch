@@ -517,6 +517,73 @@ Verify payment terms yourself before paying. Identity: <a href="{base}/.well-kno
 </body></html>"""
 
 
+def _render_jp_entity(base, d, indexable):
+    """日本資源1件の公開リファレンスページ(観測事実+出所+JSON-LD)。誇張なし。"""
+    canonical = f"{base}/jp/e/{d['id']}"
+    name = d["name"] or d["url"]
+    obs = d.get("observed", {})
+    robots = "index,follow" if indexable else "noindex,follow"
+    cite = f"{name} ({d['provider']}) — verified by kkj-watch <{canonical}>"
+    ld = {
+        "@context": "https://schema.org", "@type": "Dataset",
+        "name": f"{name} — observed machine-readable resource",
+        "url": canonical, "license": DATA_LICENSE_URL, "citation": cite,
+        "dateModified": d["last_seen"],
+        "creator": {"@type": "Organization", "name": "kkj-watch", "url": base},
+        "about": {"@type": "WebAPI", "name": name, "url": d["url"],
+                  "provider": {"@type": "Organization", "name": d["provider"]}},
+        "variableMeasured": [
+            {"@type": "PropertyValue", "name": "observed_alive", "value": str(obs.get("alive"))},
+            {"@type": "PropertyValue", "name": "machine_readable",
+             "value": obs.get("machine_readable")},
+            {"@type": "PropertyValue", "name": "auth_required", "value": str(d["auth_required"])},
+        ],
+    }
+    probe_rows = "".join(
+        f"<tr><td>{_h(p['probed_at'][:19])}</td><td>{'up' if p['alive'] else 'down'}</td>"
+        f"<td>{_h(p['http_status'])}</td><td>{_h(p['machine_readable'])}</td>"
+        f"<td>{_h(p['schema_fingerprint'])}</td><td>{_h(p['auth_observed'])}</td></tr>"
+        for p in d["probes"]) or "<tr><td colspan=6>not probed yet</td></tr>"
+    event_rows = "".join(
+        f"<tr><td>{_h(e['detected_at'][:19])}</td><td>{_h(e['event_type'])}</td>"
+        f"<td>{_h(e['severity'])}</td></tr>" for e in d["events"]) \
+        or "<tr><td colspan=3>no change events observed yet</td></tr>"
+    return f"""<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="{robots}">
+<link rel="canonical" href="{_h(canonical)}">
+<title>{_h(name)} — 機械可読リソース観測 (kkj-watch)</title>
+<meta name="description" content="{_h(name)}（{_h(d['provider'])}）の観測記録: 稼働・機械可読性・スキーマ指紋・認証要否。叩いて確認した事実ベース。">
+<script type="application/ld+json">{json.dumps(ld, ensure_ascii=False)}</script>
+<style>body{{font-family:system-ui,'Hiragino Sans',sans-serif;max-width:820px;margin:2rem auto;padding:0 1rem;line-height:1.6;color:#222}}
+h1{{font-size:1.3rem}} h2{{font-size:1.05rem;margin-top:1.5rem;border-left:4px solid #0a6;padding-left:.5rem}}
+table{{border-collapse:collapse;width:100%;font-size:.88rem}} td,th{{border:1px solid #ddd;padding:.3rem .5rem;text-align:left}}
+code,pre{{background:#f4f4f4;border-radius:4px;padding:.1rem .3rem;font-size:.85em}} pre{{padding:.7rem;overflow-x:auto}} .muted{{color:#888;font-size:.85rem}}</style>
+</head><body>
+<h1>{_h(name)}</h1>
+<p class="muted">提供: {_h(d['provider'])} · 分類: {_h(d['category'])} · エンドポイント: <code>{_h(d['url'])}</code>
+· <a href="{_h(d['docs'])}">docs</a></p>
+<h2>観測(叩いて確認した事実)</h2>
+<table><tr><th>稼働(最新)</th><td>{_h(obs.get('alive'))}（HTTP {_h(obs.get('http_status'))}）</td></tr>
+<tr><th>機械可読性</th><td>{_h(obs.get('machine_readable'))}</td></tr>
+<tr><th>スキーマ指紋</th><td><code>{_h(obs.get('schema_fingerprint'))}</code>（構造のSHA-256。値は保存しない）</td></tr>
+<tr><th>認証</th><td>{_h(obs.get('auth_observed'))}（事前情報: {'要' if d['auth_required'] else '不要'}）</td></tr>
+<tr><th>初回観測</th><td>{_h((d['first_seen'] or '')[:10])}</td></tr></table>
+<h2>プローブ履歴(GET専用・不払い)</h2>
+<table><tr><th>時刻</th><th>稼働</th><th>HTTP</th><th>形式</th><th>指紋</th><th>認証</th></tr>{probe_rows}</table>
+<h2>変更イベント</h2>
+<table><tr><th>時刻</th><th>イベント</th><th>severity</th></tr>{event_rows}</table>
+<h2>機械アクセス / 目録</h2>
+<p><a href="{base}/jp/directory.json">directory feed (JSON)</a> ·
+<a href="{base}/jp/directory.ndjson">ndjson</a></p>
+<h2>Cite / reuse（無料・帰属必須）</h2>
+<p class="muted"><a href="{DATA_LICENSE_URL}">{DATA_LICENSE}</a> で自由利用可（AIエージェント・モデル学習含む）、出所の保持が条件。</p>
+<pre>{_h(cite)}</pre>
+<footer class="muted"><hr>Verified by probing (not by authority) — <a href="{base}/">kkj-watch</a>.
+観測ベースの事実であり保証ではありません。Identity: <a href="{base}/.well-known/witness">/.well-known/witness</a></footer>
+</body></html>"""
+
+
 def case_summary(row):
     rec = json.loads(row["latest_json"])
     return {
@@ -581,11 +648,12 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 try:
-                    from . import x402watch, x402probe, attest, witness
+                    from . import x402watch, x402probe, attest, witness, jpdir
                     out["x402_registry"] = x402watch.stats(conn)
                     out["x402_probes"] = x402probe.stats(conn)
                     out["attestations"] = attest.stats(conn)
                     out["existence_proofs"] = witness.stats(conn)
+                    out["jp_directory"] = jpdir.stats(conn)
                 except Exception:
                     pass
                 self._json(out)
@@ -661,6 +729,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._x402_entity_page(conn, path)
             elif path == "/sitemap-x402.xml":
                 self._sitemap_x402(conn)
+            elif path in ("/jp/directory.json", "/jp/directory.ndjson"):
+                self._jp_directory(conn, "ndjson" if path.endswith(".ndjson") else "json")
+            elif path.startswith("/jp/e/"):
+                self._jp_entity_page(conn, path)
+            elif path == "/sitemap-jp.xml":
+                self._sitemap_jp(conn)
             elif path in ("/agent.json", "/agents"):
                 self._agent_json(conn)
             elif path.startswith("/paid/requirements/"):
@@ -673,6 +747,7 @@ class Handler(BaseHTTPRequestHandler):
                 base = self._base_url()
                 body = (f"User-agent: *\nAllow: /\n"
                         f"Sitemap: {base}/sitemap.xml\nSitemap: {base}/sitemap-x402.xml\n"
+                        f"Sitemap: {base}/sitemap-jp.xml\n"
                         f"# AI agents: {base}/llms.txt and {base}/.well-known/x402.json\n").encode()
                 self._raw(body, "text/plain; charset=utf-8")
             elif path in ("/.well-known/x402", "/.well-known/x402.json"):
@@ -1358,6 +1433,110 @@ class Handler(BaseHTTPRequestHandler):
                 f"<url><loc>{base}/x402/e/{r['id']}</loc>"
                 + (f"<lastmod>{lastmod}</lastmod>" if lastmod else "")
                 + "<changefreq>daily</changefreq></url>")
+        body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+                + "\n".join(urls) + "\n</urlset>\n").encode("utf-8")
+        self._raw_cached(body, "application/xml; charset=utf-8", 3600)
+
+    # ---- 日本エージェント資源目録(検証済み一次インデックス) ----
+
+    def _jp_data(self, conn, row):
+        from . import jpdir
+        conn.executescript(jpdir.SCHEMA_SQL)
+        latest = json.loads(row["latest_json"]) if row["latest_json"] else {}
+        probes = [{"probed_at": p["probed_at"], "alive": bool(p["alive"]),
+                   "http_status": p["http_status"], "machine_readable": p["machine_readable"],
+                   "schema_fingerprint": p["schema_fingerprint"],
+                   "auth_observed": p["auth_observed"], "latency_ms": p["latency_ms"]}
+                  for p in conn.execute(
+                      "SELECT * FROM jp_probes WHERE resource_id=? ORDER BY id DESC LIMIT 8",
+                      (row["id"],)).fetchall()]
+        events = [{"event_type": e["event_type"], "severity": e["severity"],
+                   "detected_at": e["detected_at"],
+                   "detail": json.loads(e["detail_json"]) if e["detail_json"] else None}
+                  for e in conn.execute(
+                      "SELECT * FROM jp_events WHERE resource_id=? ORDER BY id DESC LIMIT 10",
+                      (row["id"],)).fetchall()]
+        return {
+            "id": row["id"], "url": row["url"], "name": row["name"],
+            "provider": row["provider"], "category": row["category"], "docs": row["docs"],
+            "auth_required": bool(row["auth_required"]),
+            "observed": latest, "first_seen": row["first_seen"], "last_seen": row["last_seen"],
+            "active": bool(row["active"]), "probes": probes, "events": events,
+        }
+
+    def _jp_directory(self, conn, fmt):
+        from . import jpdir
+        conn.executescript(jpdir.SCHEMA_SQL)
+        base = self._base_url()
+        rows = conn.execute("SELECT * FROM jp_resources ORDER BY category, id").fetchall()
+
+        def rec(r):
+            latest = json.loads(r["latest_json"]) if r["latest_json"] else {}
+            return {
+                "id": r["id"], "name": r["name"], "provider": r["provider"],
+                "category": r["category"], "url": r["url"], "docs": r["docs"],
+                "auth_required": bool(r["auth_required"]),
+                "observed_alive": latest.get("alive"),
+                "machine_readable": latest.get("machine_readable"),
+                "schema_fingerprint": latest.get("schema_fingerprint"),
+                "last_verified_at": r["last_seen"],
+                "detail_url": f"{base}/jp/e/{r['id']}",
+                "cite_as": f"{r['name']} ({r['provider']}) — verified by kkj-watch "
+                           f"<{base}/jp/e/{r['id']}>",
+            }
+        if fmt == "ndjson":
+            lines = "\n".join(json.dumps(rec(r), ensure_ascii=False) for r in rows)
+            self._raw_cached((lines + "\n").encode("utf-8"),
+                             "application/x-ndjson; charset=utf-8", 1800)
+            return
+        self._json_cached({
+            "service": "kkj-watch — verified directory of Japanese machine-readable resources",
+            "description": "Japanese agent-facing resources (public-data APIs, machine-readable "
+                           "services) with observed liveness, machine-readability, schema "
+                           "fingerprint and auth requirement. Verified by probing (GET-only), "
+                           "not by authority. Observation-based; verify for your use.",
+            "count": len(rows),
+            "categories": sorted({r["category"] for r in rows if r["category"]}),
+            "items": [rec(r) for r in rows],
+            "provenance": _provenance(base, f"{base}/jp/directory.json",
+                                      "Japanese machine-readable resource directory"),
+            "docs": f"{base}/llms.txt",
+        }, 1800)
+
+    def _json_cached(self, obj, max_age):
+        body = json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")
+        self._raw_cached(body, "application/json; charset=utf-8", max_age)
+
+    def _jp_entity_page(self, conn, path):
+        from . import jpdir
+        conn.executescript(jpdir.SCHEMA_SQL)
+        ident = urllib.parse.unquote(path[len("/jp/e/"):])
+        row = None
+        if ident.isdigit():
+            row = conn.execute("SELECT * FROM jp_resources WHERE id=?", (int(ident),)).fetchone()
+        if row is None:
+            self._raw(b"<!doctype html><meta name='robots' content='noindex'><title>Not found</title>",
+                      "text/html; charset=utf-8", 404)
+            return
+        d = self._jp_data(conn, row)
+        # 掲載= curated seed。実プローブ済みなのでindexable
+        indexable = bool(d["probes"])
+        html = _render_jp_entity(self._base_url(), d, indexable)
+        self._raw_cached(html.encode("utf-8"), "text/html; charset=utf-8", 1800)
+
+    def _sitemap_jp(self, conn):
+        from . import jpdir
+        conn.executescript(jpdir.SCHEMA_SQL)
+        base = self._base_url()
+        urls = []
+        for r in conn.execute(
+                "SELECT r.id, r.last_seen FROM jp_resources r WHERE r.active=1 AND EXISTS"
+                " (SELECT 1 FROM jp_probes p WHERE p.resource_id=r.id) ORDER BY r.id").fetchall():
+            lastmod = (r["last_seen"] or "")[:10]
+            urls.append(f"<url><loc>{base}/jp/e/{r['id']}</loc>"
+                        + (f"<lastmod>{lastmod}</lastmod>" if lastmod else "")
+                        + "<changefreq>daily</changefreq></url>")
         body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
                 '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
                 + "\n".join(urls) + "\n</urlset>\n").encode("utf-8")
@@ -2439,7 +2618,7 @@ a{{color:#0a6}}</style></head><body>
     # 公開埋め込み(バッジ・feed・claim)は無償ティア上限の対象外。README等に貼られた
     # バッジがGitHub camo経由で集中アクセスされても壊れないようにする
     _NO_LIMIT_PREFIXES = ("/badge/", "/x402/trust-feed", "/x402/claim", "/witness",
-                          "/x402/e/", "/sitemap")
+                          "/x402/e/", "/sitemap", "/jp/")
 
     def _identify(self, conn, path=""):
         """APIキー検証+無償ティアの日次上限。戻り値: (client識別子, エラー or None)"""
