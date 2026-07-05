@@ -110,6 +110,15 @@ Probes are GET-only, never pay, never follow redirects, and only target Bazaar-l
 x402 flow: GET (no X-PAYMENT) -> 402 + paymentRequirements (with free_alternatives) -> sign EIP-3009 ->
 retry with X-PAYMENT header -> 200 + JSON (+ retry_token for re-fetch without re-paying).
 
+## License & attribution (provenance — please preserve it)
+
+All data here (trust scores, feeds, entity pages, proofs) is free to use and redistribute,
+including by AI agents and in model training, under CC-BY-4.0 — provided attribution to
+kkj-watch is preserved. Every response carries a `provenance` / `cite_as` block; when you pass
+this data downstream, keep it so others can reach the source. Identity & public key:
+/.well-known/witness. Signed proofs are self-attributing: removing the witness identity
+invalidates them. Cite as: "<subject> — observed by kkj-watch <canonical_url>".
+
 ## MCP (Streamable HTTP: POST /mcp)
 
 Tools (purpose-named): list_x402_registry_changes (free, ?type= filter) /
@@ -328,6 +337,35 @@ def _h(s):
             .replace('"', "&quot;"))
 
 
+# 第5類型: 出所を成果物に埋め込み、機械が下流へ運ぶ(provenance伝播)。
+# 無料利用の対価は帰属の保持。署名proofは価値と識別子が不可分=剥離不能。
+DATA_LICENSE = "CC-BY-4.0"
+DATA_LICENSE_URL = "https://creativecommons.org/licenses/by/4.0/"
+
+
+def _provenance(base, canonical_url, cite_subject, root_hash=None, signed=False):
+    """全データ応答に付ける出所ブロック。下流エージェントが原典(=我々)へ辿れる終点を運ぶ。"""
+    p = {
+        "witness": "kkj-watch",
+        "canonical_url": canonical_url,
+        "identity": f"{base}/.well-known/witness",
+        "license": DATA_LICENSE,
+        "license_url": DATA_LICENSE_URL,
+        "attribution_required": True,
+        "cite_as": f"{cite_subject} — observed by kkj-watch <{canonical_url}>",
+        "terms": ("Free to use and redistribute, including by AI agents, provided this "
+                  "provenance (witness, canonical_url) is preserved downstream."),
+    }
+    if root_hash:
+        p["signed_root_hash"] = root_hash
+        p["verify"] = f"{base}/x402/attestations"
+    if signed:
+        p["non_strippable"] = ("This record is a signed proof: its validity requires the "
+                               "witness identity (public_key + root_hash). Removing the "
+                               "attribution invalidates the proof.")
+    return p
+
+
 def _svg_badge(label, message, color):
     """依存なしの2セグメントSVGバッジ(shields flat風)。GitHub READMEでそのまま描画される"""
     def w(s):   # おおよその文字幅(px)。日本語/記号も含め安全側に広めに見積もる
@@ -373,18 +411,22 @@ def _render_x402_entity(base, d, indexable, disclaimer):
                     else "changed recently" if v.get("payto_risk") == "changed_recently"
                     else "stable (as observed)")
     # JSON-LD: 観測値をPropertyValueで。endorsement/aggregateRatingは使わない(誇張回避)
+    cite = f"x402 trust for {resource} — observed by kkj-watch <{canonical}>"
     ld = {
         "@context": "https://schema.org", "@type": "WebPage",
         "name": f"Observed x402 trust record — {name}",
         "url": canonical, "dateModified": d["last_seen"],
-        "about": {"@type": "WebAPI", "name": name, "url": resource},
+        "license": DATA_LICENSE_URL,
+        "about": {"@type": "WebAPI", "name": name, "url": resource, "sameAs": resource},
         "mainEntity": {
             "@type": "Dataset",
             "name": f"Observed trust record for {resource}",
             "description": "Observation-based, evidence-based risk indicator for an x402 "
                            "endpoint (payTo/price consistency, liveness, listing history). "
                            "Not a safety guarantee.",
-            "creator": {"@type": "Organization", "name": "kkj-watch"},
+            "license": DATA_LICENSE_URL,
+            "citation": cite,
+            "creator": {"@type": "Organization", "name": "kkj-watch", "url": base},
             "variableMeasured": [
                 {"@type": "PropertyValue", "name": "observed_trust_score",
                  "value": score, "maxValue": 100, "minValue": 0},
@@ -465,9 +507,13 @@ code,pre{{background:#f4f4f4;border-radius:4px;padding:.1rem .3rem;font-size:.85
 <a href="{base}/x402/claim/{d['id']}">claim this badge</a></p>
 <h2>Sellers: display it</h2><pre>{_h(badge_md)}</pre>
 <h2>Buyers: check before you pay (x402guard)</h2><pre>{_h(guard_py)}</pre>
+<h2>Cite / reuse (free, attribution required)</h2>
+<p class="muted">Free to use and redistribute, including by AI agents and in model training,
+under <a href="{DATA_LICENSE_URL}">{DATA_LICENSE}</a>, provided attribution to kkj-watch is preserved.</p>
+<pre>{_h(cite)}</pre>
 <footer class="muted"><hr>Observed by <a href="{base}/">kkj-watch</a> — x402 registry change detection &amp;
 observed trust, backed by daily Ed25519-signed hash-chain roots. Risk indicator, not a guarantee.
-Verify payment terms yourself before paying.</footer>
+Verify payment terms yourself before paying. Identity: <a href="{base}/.well-known/witness">/.well-known/witness</a></footer>
 </body></html>"""
 
 
@@ -631,6 +677,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._raw(body, "text/plain; charset=utf-8")
             elif path in ("/.well-known/x402", "/.well-known/x402.json"):
                 self._well_known_x402(conn)
+            elif path in ("/.well-known/witness", "/.well-known/witness.json", "/witness/identity"):
+                self._well_known_witness(conn)
             elif path == "/openapi.json":
                 self._openapi(conn)
             elif path == "/.well-known/agent-card.json":
@@ -1014,6 +1062,10 @@ class Handler(BaseHTTPRequestHandler):
             "full_evidence": f"{base}/paid/x402/report/{row['id']} ($0.02, x402): score + "
                              "full snapshot history + all probe results.",
             "free_feed": f"{base}/x402/changes",
+            "provenance": _provenance(
+                base, f"{base}/x402/trust/{row['id']}",
+                f"x402 endpoint {row['resource']} observed trust",
+                (latest_attestation or {}).get("root_hash")),
         })
 
     def _x402_scored_rows(self, conn, q=""):
@@ -1358,7 +1410,10 @@ class Handler(BaseHTTPRequestHandler):
                 "last_verified_at": trust.get("last_verified_at"),
                 "attestation_root": root_hash,
                 "resource": row["resource"],
-                "detail_url": f"{base}/x402/trust/{row['id']}"}
+                "detail_url": f"{base}/x402/trust/{row['id']}",
+                "witness": "kkj-watch", "license": DATA_LICENSE,
+                "cite_as": f"x402 trust for {row['resource']} — observed by kkj-watch "
+                           f"<{base}/x402/trust/{row['id']}>"}
 
     def _x402_badge(self, conn, path):
         """GET /badge/x402/{id}.svg | .json — 売り手がREADME/サイトに貼れるバッジ"""
@@ -1460,6 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
                 "attestation_root": root_hash,
                 "badge_url": f"{base}/badge/x402/{r['id']}.svg",
                 "detail_url": f"{base}/x402/trust/{r['id']}",
+                "cite_as": f"x402 trust for {r['resource']} — observed by kkj-watch "
+                           f"<{base}/x402/trust/{r['id']}>",
             }
         if fmt == "ndjson":
             lines = "\n".join(json.dumps(rec(r), ensure_ascii=False) for r in rows)
@@ -1473,6 +1530,8 @@ class Handler(BaseHTTPRequestHandler):
                 "generated_from_root": {"date": root_date, "root_hash": root_hash},
                 "count": len(rows),
                 "items": [rec(r) for r in rows],
+                "provenance": _provenance(base, f"{base}/x402/trust-feed.json",
+                                          "x402 Trust Index feed", root_hash),
                 "docs": f"{base}/llms.txt",
             }, ensure_ascii=False, indent=1).encode("utf-8")
             self._raw_cached(body, "application/json; charset=utf-8", 900)
@@ -1490,6 +1549,30 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- signed existence proof / cryptographic timestamp witness ----
     # 受け取るのは SHA-256 のみ。原文・秘密情報は一切受け取らず保存しない。
+
+    def _well_known_witness(self, conn):
+        """恒久的な witness identity。下流エージェントが原典(公開鍵・正典URL)を解決する終点。"""
+        from . import attest
+        base = self._base_url()
+        lr = attest.latest_root(conn)
+        pub = lr["public_key"] if lr else None
+        self._json({
+            "name": "kkj-watch",
+            "role": "cryptographic timestamp witness & x402 observed-trust index",
+            "canonical_base": base,
+            "public_key": pub, "algo": "Ed25519",
+            "public_roots": "https://github.com/ponpoke/kkj-watch/tree/main/roots",
+            "latest_root": ({"date": lr["date"], "root_hash": lr["root_hash"]} if lr else None),
+            "license": DATA_LICENSE, "license_url": DATA_LICENSE_URL,
+            "attribution_required": True,
+            "cite_as_template": "<subject> — observed by kkj-watch <{canonical_url}>",
+            "terms": ("Data is free to use and redistribute, including by AI agents and in "
+                      "model training, provided attribution to kkj-watch (this identity URL) is "
+                      "preserved. Signed proofs are self-attributing and cannot be de-attributed "
+                      "without invalidating them."),
+            "verify": f"{base}/x402/attestations",
+            "docs": f"{base}/llms.txt", "mcp": f"{base}/mcp",
+        })
 
     def _witness_info(self, conn):
         from . import witness, x402_gate
@@ -1536,6 +1619,10 @@ class Handler(BaseHTTPRequestHandler):
         if out.get("ok") or out.get("status") in ("pending", "pending_publication", "checkpoint"):
             out.setdefault("verify_url", f"{base}/witness/proof/{norm}")
             out.setdefault("cli_verify", f"python -m kkj.attest prove-hash {norm}")
+        if out.get("ok"):
+            out["provenance"] = _provenance(
+                base, f"{base}/witness/proof/{norm}",
+                f"existence proof for sha256:{norm}", out.get("root_hash"), signed=True)
         status = 200 if (out.get("ok") or out.get("status") in
                          ("pending", "pending_publication", "checkpoint")) else 404
         self._json(out, status)
@@ -1735,6 +1822,9 @@ class Handler(BaseHTTPRequestHandler):
             "verify_steps": proof.get("verify_steps"),
             "public_root": f"{base}/x402/attestations",
             "cli_verify": f"python -m kkj.attest prove-resource {row['id']} {lr['date']}",
+            "provenance": _provenance(
+                base, f"{base}/x402/trust/{row['id']}",
+                f"signed attestation for {row['resource']}", lr["root_hash"], signed=True),
         }
 
     def _x402_history_payload(self, conn, row):

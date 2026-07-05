@@ -4,6 +4,15 @@
 > 1. **x402 registry watch**: every change in the x402 Bazaar registry (23k+ resources) — `price_changed`, `payto_changed` (receiving-address change: verify before paying), `schema_changed`, listings/delistings. Free: `/x402/changes` (filter `?type=`), `/x402/resources?q=`, `/x402/sample-change`. Paid: `/paid/x402/history/{id}` ($0.01, full SHA-256 audit trail).
 > 2. **Japanese procurement watch**: corrections, deadline changes, document replacements. Free: `/events` (filter `?tag=`), `/cases?query=`, `/sample-diff`, `/agent.json`. Paid (x402): `/paid/requirements/{key}` ($0.02, cached), `/paid/analyze-now/{key}` ($0.30, fresh LLM).
 
+## Provenance伝播レイヤー（第5類型: 使われるほど原典へ辿られる）
+
+Hotmailのフッターは剥がせたが、本システムの**署名付きproofは価値と識別子が不可分**（識別子を消すと検証が壊れる）＝剥離不能な出所。全データ応答に `provenance`/`cite_as` ブロック（witness・canonical_url・license・署名root）を埋め込み、出所を保持する下流エージェントが原典（我々）へ機械的に辿れる終点を運ぶ。
+
+- 帰属ライセンス: データは **CC-BY-4.0** で自由利用可（AIエージェント・モデル学習含む）、**出所の保持が条件**。無料の対価は帰属
+- 恒久identity: `GET /.well-known/witness`（公開鍵・正典URL・cite_asテンプレ・公開roots）
+- 付与先: `/x402/trust`・`/x402/trust-feed`・`/paid/x402/attest`・`/witness/proof`・エンティティページ(JSON-LD `license`/`citation`/`sameAs`)・バッジJSON
+- 署名proof/attestationは `witness`+`attribution` を同梱し、識別子を消すと検証不成立（=非剥離）
+
 ## プログラマティックGEO: resource毎の公開リファレンスページ
 
 `GET /x402/e/{id}` = 監視中x402エンドポイント1件ごとの公開ページ。検索エンジン/LLMに取り込まれ「is this x402 endpoint OK to pay?」の答えになる情報surfaceを、営業ゼロ・限界費用ゼロで所有する狙い。各ページはresource固有の実観測(観測verdict・価格・payTo/価格変更履歴・GETプローブ結果・スナップショット数・署名アテステーション状況)を必ず含み、JSON-LD・canonical・バッジ/ x402guardスニペット・trust-feed/attestationリンクを備える。

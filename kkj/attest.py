@@ -615,6 +615,9 @@ def prove_anchor(sha256, conn=None):
         "merkle_root": row["merkle_root"], "root_hash": row["root_hash"],
         "previous_root": row["previous_root"], "created_at": row["created_at"],
         "algo": row["algo"], "public_key": row["public_key"], "signature": row["signature"],
+        "witness": "kkj-watch",
+        "attribution": "Signed existence proof by kkj-watch. This proof is invalid without the "
+                       "witness identity (public_key + root_hash); it cannot be de-attributed.",
         "verify_steps": [
             "1. leaf_hash == sha256(canonical(record)); record.sha256 is your digest",
             "2. fold inclusion_proof over leaf_hash (node=sha256(left||right)) == merkle_root",
