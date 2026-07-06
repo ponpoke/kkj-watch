@@ -64,6 +64,14 @@ def connect():
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     # timeout: 高速レーン(毎時巡回)と低速レーン(文書・抽出)の並走時のロック待ち
     conn = sqlite3.connect(config.DB_PATH, timeout=60)
+    # WAL: リーダ(集計)とライタ(毎リクエストのusage_log/巡回)が互いをブロックしない。
+    # 高頻度アクセスログ下でのロック競合(database is locked)を根本的に避ける。
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.OperationalError:
+        pass
     conn.executescript(SCHEMA)
     try:  # 移行: 原典文書の抽出テキスト版管理(内部保存・再配布はしない)
         conn.execute("ALTER TABLE documents ADD COLUMN text")

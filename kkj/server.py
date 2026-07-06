@@ -664,7 +664,9 @@ class Handler(BaseHTTPRequestHandler):
                     out["attestations"] = attest.stats(conn)
                     out["existence_proofs"] = witness.stats(conn)
                     out["jp_directory"] = jpdir.stats(conn)
-                    out["discovery_kpi"] = discovery.report(conn)
+                    # 要件7: 手動SQLなしで面別KPIを見られる。/statsは高速優先でrDNS解決はしない
+                    # (キャッシュのみ参照; 解決は `python -m kkj.discovery` / timerが担う)
+                    out["discovery_surfaces"] = discovery.report(conn, resolve=False)
                 except Exception:
                     pass
                 self._json(out)
