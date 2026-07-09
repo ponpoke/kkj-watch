@@ -70,8 +70,8 @@ def main():
     # ツール数は増減するため、コアツールの存在で検証する
     tool_names = {t["name"] for t in r["result"]["tools"]}
     check("mcp tools/list has core tools",
-          {"search_cases", "get_case", "list_change_events",
-           "get_requirements"} <= tool_names, str(sorted(tool_names)))
+          {"find_tender_deadline_changes", "get_tender_change_evidence",
+           "get_cached_tender_requirements", "list_japan_procurement_changes"} <= tool_names)
     r = mcp_server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                            "params": {"name": "search_cases", "arguments": {"query": "テスト"}}})
     hits = json.loads(r["result"]["content"][0]["text"])

@@ -58,6 +58,16 @@ Ed25519-signed hash-chain root and return a signed Merkle inclusion proof.
 - GET /badge/x402/{id}.svg : a seller-displayable badge (also .json, shields.io-compatible).
   Sellers: get your copy-paste snippet at GET /x402/claim/{id} — show buyers your observed trust.
 
+### For operators of listed endpoints — flagged? re-verify now (paid)
+
+Your listing is scored automatically by the free probe cycle (~29h). If you were flagged
+(payTo mismatch / dead / price mismatch / not_x402) and have FIXED the issue:
+- GET /paid/x402/reverify/{id} : $0.25 via x402 — we GET-probe your endpoint immediately,
+  recompute the score with the same public formula used for everyone, emit recovery events
+  to the public feed, and return the fresh observation. Buys SPEED and EVIDENCE only —
+  the score itself cannot be bought, and the free cycle continues regardless.
+  (5-min cooldown per resource; unsafe/unknown listings are rejected BEFORE payment.)
+
 ### x402guard — check before you pay (drop-in, free, open source)
 
 Don't want to call an API by hand? Wrap your existing x402 payment in one line and it checks
@@ -85,6 +95,7 @@ listing age/stability, and spam-farm detection (one payTo behind dozens of listi
 - GET /paid/x402/report/{id} : $0.02 — the full due-diligence dossier: trust score with evidence,
   every registry snapshot (SHA-256 audit trail), every change event, every live-probe result.
 - GET /paid/x402/history/{id} : $0.01 — snapshot + change-event history only.
+- GET /paid/x402/reverify/{id} : $0.25 — operator instant re-verification (see above).
 
 Why this exists: the x402 protocol re-fetches payment terms at 402 time, so it happily pays a
 hijacked payTo or a silently-10x'd price. Only history + independent live verification catches that.
@@ -535,6 +546,12 @@ code,pre{{background:#f4f4f4;border-radius:4px;padding:.1rem .3rem;font-size:.85
 <a href="{base}/x402/trust-feed.json">trust feed</a> ·
 <a href="{base}/x402/claim/{d['id']}">claim this badge</a></p>
 <h2>Sellers: display it</h2><pre>{_h(badge_md)}</pre>
+<h2>Operators: flagged? re-verify now</h2>
+<p class="muted">Flags and this score update automatically on the free probe cycle (~29h).
+If you fixed an issue and need fresh public evidence immediately:
+<a href="{base}/paid/x402/reverify/{d['id']}">instant re-verification ($0.25, x402)</a> —
+an immediate GET probe, score recompute with the same public formula, and recovery events
+to the public feed. Buys speed and evidence only; <strong>the score itself cannot be bought</strong>.</p>
 <h2>Buyers: check before you pay (x402guard)</h2><pre>{_h(guard_py)}</pre>
 <h2>Cite / reuse (free, attribution required)</h2>
 <p class="muted">Free to use and redistribute, including by AI agents and in model training,
@@ -765,6 +782,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._paid_x402_report(conn, path)
             elif path.startswith("/paid/x402/attest/"):
                 self._paid_x402_attest(conn, path)
+            elif path.startswith("/paid/x402/reverify/"):
+                self._paid_x402_reverify(conn, path)
             elif path == "/x402/attestations":
                 self._x402_attestations(conn)
             elif path.startswith("/badge/x402/"):
@@ -994,6 +1013,10 @@ class Handler(BaseHTTPRequestHandler):
                         "schema_changed", "description_changed",
                         "new_resource", "delisted", "relisted"]
 
+    # 運営者に是正/確認のアクションがあるイベント(フィード上でreverify導線を出す)
+    X402_FLAG_EVENTS = ("live_payto_mismatch", "live_price_mismatch", "endpoint_dead",
+                        "payto_changed", "price_changed", "not_x402", "delisted")
+
     def _x402_free_hint(self):
         base = self._base_url()
         return {"free_changes_feed": f"{base}/x402/changes",
@@ -1022,13 +1045,20 @@ class Handler(BaseHTTPRequestHandler):
         params.append(limit)
         out = []
         for r in conn.execute(sql, params).fetchall():
-            out.append({
+            item = {
                 "resource": r["resource"], "service_name": r["service_name"],
                 "event_type": r["event_type"], "severity": r["severity"],
                 "detected_at": r["detected_at"],
                 "detail": json.loads(r["detail_json"]) if r["detail_json"] else None,
                 "paid_history": f"{base}/paid/x402/history/{r['resource_id']}",
-            })
+            }
+            # フラグの発生自体が運営者への通知になる(相手の監視がこのフィードを取得する)
+            if r["event_type"] in self.X402_FLAG_EVENTS:
+                item["operator_action"] = (
+                    f"Operator of this endpoint? Fixed it? Instant re-verify + fresh public "
+                    f"evidence: {base}/paid/x402/reverify/{r['resource_id']} ($0.25, x402). "
+                    "Free re-probe happens within ~29h regardless.")
+            out.append(item)
         self._json({
             "service": "kkj-watch / x402-registry-watch",
             "feed": "Change events in the x402 Bazaar registry: price changes, payTo (receiving "
@@ -1192,6 +1222,16 @@ class Handler(BaseHTTPRequestHandler):
             "select_for_task": f"{base}/x402/best?q=&min_trust=80&max_price_usd=0.01",
             "full_evidence": f"{base}/paid/x402/report/{row['id']} ($0.02, x402): score + "
                              "full snapshot history + all probe results.",
+            "operator": {
+                "note": "Run this endpoint? Flags and score update automatically on the "
+                        "free probe cycle (~29h). Fixed an issue and need fresh public "
+                        "evidence NOW:",
+                "instant_reverify": f"{base}/paid/x402/reverify/{row['id']} ($0.25, x402): "
+                                    "immediate GET probe + score recompute + recovery "
+                                    "events to the public feed. Buys speed and evidence "
+                                    "only - the score itself cannot be bought.",
+                "badge": f"{base}/x402/claim/{row['id']}",
+            },
             "free_feed": f"{base}/x402/changes",
             "provenance": _provenance(
                 base, f"{base}/x402/trust/{row['id']}",
@@ -1709,6 +1749,10 @@ class Handler(BaseHTTPRequestHandler):
             "note": "Displays your OBSERVED trust score (payTo/price consistency, liveness, "
                     "age, spam-farm) with a link to signed evidence. It updates automatically "
                     "as we keep observing. Not a safety guarantee.",
+            "operator_instant_reverify": f"{base}/paid/x402/reverify/{rid} ($0.25, x402): "
+                                         "fixed an issue? Immediate GET probe + score "
+                                         "recompute + recovery events to the public feed. "
+                                         "The score itself cannot be bought.",
         })
 
     def _x402_trust_feed(self, conn, fmt, limit):
@@ -1958,6 +2002,140 @@ class Handler(BaseHTTPRequestHandler):
                         "GitHub for independent, time-stamped verification.")
         self._json(doc)
 
+    # 運営者向け即時再検証: 買えるのは「速度と証拠」だけ。スコアは金で買えない
+    X402_REVERIFY_PRICE_USD = 0.25
+    X402_REVERIFY_COOLDOWN_SEC = 300
+
+    def _paid_x402_reverify(self, conn, path):
+        """有料($0.25): 掲載エンドポイントの運営者向け即時再検証。
+        今すぐGETプローブ→同じ公開式でスコア再計算→状態遷移イベントを公開フィードへ→
+        新鮮な観測結果を返す。無料の定期再プローブ(~29h周期)は支払いと無関係に必ず回る。
+        観測が「dead」でもそれをそのまま返す(正直な観測が商品)。"""
+        from . import x402_gate, x402watch, x402probe, x402trust, paid
+        conn.executescript(x402watch.SCHEMA_SQL)
+        conn.executescript(x402probe.SCHEMA_SQL)
+        ident = urllib.parse.unquote(path[len("/paid/x402/reverify/"):])
+        base = self._base_url()
+        if not x402_gate.available():
+            self._json({"error": "payments_not_configured"}, 503)
+            return
+        row = self._x402_find(conn, ident)
+        # paid-but-denied防止: 対象なし→404(課金しない)
+        if row is None:
+            self._json({"error": "not_found", "hint": f"Find your resource id for free at "
+                        f"{base}/x402/resources?q=..."}, 404)
+            return
+        # paid-but-denied防止: 安全にプローブできないURLには課金しない(SSRFガード)
+        try:
+            x402probe.assert_url_allowed(row["resource"])
+        except Exception as e:
+            self._json({"error": "unprobeable_url", "detail": str(e)[:200],
+                        "hint": "This listing cannot be probed safely. No charge."}, 409)
+            return
+        # 対象ホストへの配慮: 同一resourceの再検証は5分に1回まで(課金前に判定)
+        last = conn.execute(
+            "SELECT probed_at FROM x402_probes WHERE resource_id=? ORDER BY id DESC LIMIT 1",
+            (row["id"],)).fetchone()
+        if last:
+            try:
+                import datetime as _dt
+                prev = _dt.datetime.fromisoformat(last["probed_at"])
+                wait = self.X402_REVERIFY_COOLDOWN_SEC - (
+                    _dt.datetime.now(_dt.timezone.utc) - prev).total_seconds()
+                if wait > 0:
+                    self._json({
+                        "error": "cooldown", "retry_after_seconds": int(wait),
+                        "hint": "This resource was probed very recently; the free score "
+                                f"already reflects it: {base}/x402/trust/{row['id']}. "
+                                "No charge.",
+                    }, 429)
+                    return
+            except (ValueError, TypeError):
+                pass
+        resource = f"{base}{path}"
+        reqs = x402_gate.payment_requirements(
+            resource,
+            "Operator instant re-verification of a Bazaar-listed x402 endpoint: we "
+            "immediately GET-probe it (liveness + listing-vs-live payTo/price consistency), "
+            "recompute its observed trust score with the same public formula used for "
+            "everyone, emit any state-change events (e.g. recovery) to the public feed, and "
+            "return the fresh observation. Buys SPEED and EVIDENCE only - the score itself "
+            "cannot be bought, and the free re-probe cycle (~29h) continues regardless. "
+            f"Current state (free): {base}/x402/trust/{row['id']}",
+            output_schema={"input": {"type": "http", "method": "GET"}},
+            price_usd=self.X402_REVERIFY_PRICE_USD,
+        )
+        job = self._settle_and_claim(conn, reqs, resource, f"x402rv:{row['id']}",
+                                     free_hint=self._x402_free_hint())
+        if job is None:
+            return
+        if job["status"] == "succeeded" and job["result_json"]:
+            self._json({"cached": True, "reverification": json.loads(job["result_json"]),
+                        "retry_token": job["retry_token"]})
+            return
+        # 支払い確定後: 即時プローブ。予期せぬ例外でも観測行を記録し必ず結果を返す
+        ts = store.now_utc()
+        try:
+            x402probe.probe_one(conn, row, ts)
+        except Exception as e:
+            conn.execute(
+                "INSERT INTO x402_probes(resource_id, probed_at, alive, http_status, is_402,"
+                " latency_ms, live_accepts_json, consistency, fail_count, error)"
+                " VALUES (?,?,0,NULL,0,NULL,NULL,'error',0,?)", (row["id"], ts, str(e)[:200]))
+        try:
+            x402trust.update_score(conn, row["id"])
+        except Exception:
+            pass
+        conn.commit()
+        probe = conn.execute(
+            "SELECT * FROM x402_probes WHERE resource_id=? ORDER BY id DESC LIMIT 1",
+            (row["id"],)).fetchone()
+        events = [{"event_type": e["event_type"], "severity": e["severity"],
+                   "detail": json.loads(e["detail_json"]) if e["detail_json"] else None}
+                  for e in conn.execute(
+                      "SELECT * FROM x402_events WHERE resource_id=? AND detected_at=?",
+                      (row["id"], ts)).fetchall()]
+        fresh = conn.execute(
+            "SELECT trust_score, trust_json FROM x402_resources WHERE id=?",
+            (row["id"],)).fetchone()
+        payload = {
+            "service": "kkj-watch x402 Trust Index - operator instant re-verification",
+            "integrity_note": "This purchase triggered an immediate observation. The score "
+                              "is computed from observations by the same public, versioned "
+                              "formula for everyone - it cannot be bought.",
+            "disclaimer": x402trust.SCORE_DISCLAIMER,
+            "resource": row["resource"], "resource_id": row["id"],
+            "service_name": row["service_name"],
+            "probed_at": ts,
+            "probe": {
+                "alive": bool(probe["alive"]), "http_status": probe["http_status"],
+                "is_402": bool(probe["is_402"]), "latency_ms": probe["latency_ms"],
+                "consistency": probe["consistency"],
+                "live_accepts": (json.loads(probe["live_accepts_json"])
+                                 if probe["live_accepts_json"] else None),
+                "error": probe["error"],
+            },
+            "observed_trust_score": fresh["trust_score"],
+            "trust": json.loads(fresh["trust_json"]) if fresh["trust_json"] else None,
+            "events_emitted": events,
+            "public_trust_page": f"{base}/x402/trust/{row['id']}",
+            "badge": f"{base}/badge/x402/{row['id']}.svg",
+            "signed_attestation": f"{base}/paid/x402/attest/{row['id']} ($0.02) once "
+                                  "tonight's signed daily root (~23:55 UTC) commits this "
+                                  "observation",
+        }
+        paid.finish(conn, job["retry_token"], "succeeded", payload)
+        body = json.dumps({"cached": False, "reverification": payload,
+                           "retry_token": job["retry_token"]},
+                          ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if job["settlement"]:
+            self.send_header("X-PAYMENT-RESPONSE", job["settlement"])
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _paid_x402_attest(self, conn, path):
         """有料($0.02): 署名付きアテステーション(要件10)。
         resourceの観測記録・trust score・inclusion proof・daily root・署名・検証手順を返す。"""
@@ -2185,6 +2363,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/paid/x402/attest/{id}": op(
                     "Signed attestation: inclusion proof + daily hash-chain root, $0.02 via x402",
                     paid=True),
+                "/paid/x402/reverify/{id}": op(
+                    "Operator instant re-verification: immediate probe + score recompute, "
+                    "$0.25 via x402 (score itself cannot be bought)", paid=True),
                 "/x402/attestations": op("Latest signed daily hash-chain root (free)"),
             },
         })
@@ -2302,6 +2483,24 @@ class Handler(BaseHTTPRequestHandler):
                 "type": "http", "method": "GET",
                 "x402Version": 1,
                 "accepts": [attest_reqs],
+                "lastUpdated": store.now_utc(),
+            })
+            reverify_reqs = x402_gate.payment_requirements(
+                f"{base}/paid/x402/reverify/1",
+                "Operator instant re-verification of a Bazaar-listed x402 endpoint: "
+                "immediate GET probe (liveness + listing-vs-live payTo/price consistency), "
+                "score recompute with the same public formula, recovery events to the "
+                "public feed, fresh observation returned. Buys speed and evidence only - "
+                "the score itself cannot be bought; the free re-probe cycle (~29h) "
+                f"continues regardless. Find your id free: {base}/x402/resources?q=...",
+                output_schema={"input": {"type": "http", "method": "GET"}},
+                price_usd=self.X402_REVERIFY_PRICE_USD,
+            )
+            resources.append({
+                "resource": f"{base}/paid/x402/reverify/1",
+                "type": "http", "method": "GET",
+                "x402Version": 1,
+                "accepts": [reverify_reqs],
                 "lastUpdated": store.now_utc(),
             })
         self._json({

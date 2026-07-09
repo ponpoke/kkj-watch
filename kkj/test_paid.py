@@ -121,6 +121,58 @@ def main():
     st, body = get(port, "/paid/analyze-now/UNEXTRACTED?retry_token=" + j["retry_token"])
     check("別case_keyへのtoken使用は403", st == 403, f"(got {st})")
 
+    # ---- /paid/x402/reverify/{id}: 運営者向け即時再検証の支払い前分岐 ----
+    from . import x402watch, x402probe
+    c3 = store.connect()
+    c3.executescript(x402watch.SCHEMA_SQL)
+    c3.executescript(x402probe.SCHEMA_SQL)
+    now = store.now_utc()
+    # unsafe: プライベートIP直書きURL(SSRFガードが課金前に拒否するはず)
+    c3.execute("INSERT INTO x402_resources(resource, service_name, first_seen, last_seen,"
+               " active, latest_hash, latest_json) VALUES (?,?,?,?,1,'h1','{}')",
+               ("https://192.0.2.1/x402", "unsafe-test", now, now))
+    unsafe_id = c3.execute("SELECT id FROM x402_resources WHERE service_name='unsafe-test'"
+                           ).fetchone()["id"]
+    # clean: SSRFガードをモックして通す(オフラインでDNS解決しないため)
+    c3.execute("INSERT INTO x402_resources(resource, service_name, first_seen, last_seen,"
+               " active, latest_hash, latest_json) VALUES (?,?,?,?,1,'h2','{}')",
+               ("https://clean.example/x402", "clean-test", now, now))
+    clean_id = c3.execute("SELECT id FROM x402_resources WHERE service_name='clean-test'"
+                          ).fetchone()["id"]
+    # cooled: 直近プローブ済み(クールダウンが課金前に429を返すはず)
+    c3.execute("INSERT INTO x402_resources(resource, service_name, first_seen, last_seen,"
+               " active, latest_hash, latest_json) VALUES (?,?,?,?,1,'h3','{}')",
+               ("https://cooled.example/x402", "cooled-test", now, now))
+    cooled_id = c3.execute("SELECT id FROM x402_resources WHERE service_name='cooled-test'"
+                           ).fetchone()["id"]
+    c3.execute("INSERT INTO x402_probes(resource_id, probed_at, alive, is_402, consistency,"
+               " fail_count) VALUES (?,?,1,1,'ok',0)", (cooled_id, now))
+    c3.commit()
+    c3.close()
+
+    st, body = get(port, "/paid/x402/reverify/999999")
+    check("reverify: 存在しないidは404(課金しない)", st == 404, f"(got {st})")
+
+    st, body = get(port, f"/paid/x402/reverify/{unsafe_id}")
+    check("reverify: プローブ不能URLは409(課金しない)",
+          st == 409 and body.get("error") == "unprobeable_url", f"(got {st})")
+
+    _orig_assert = x402probe.assert_url_allowed
+    x402probe.assert_url_allowed = lambda url: None
+    try:
+        st, body = get(port, f"/paid/x402/reverify/{cooled_id}")
+        check("reverify: 直近プローブ済みは429クールダウン(課金しない)",
+              st == 429 and body.get("error") == "cooldown"
+              and body.get("retry_after_seconds", 0) > 0, f"(got {st})")
+
+        st, body = get(port, f"/paid/x402/reverify/{clean_id}")
+        check("reverify: 正常対象は402(支払い要求)",
+              st == 402 and "accepts" in body, f"(got {st})")
+        check("reverify: 402の説明に「スコアは買えない」を明記",
+              "cannot be bought" in json.dumps(body), "")
+    finally:
+        x402probe.assert_url_allowed = _orig_assert
+
     httpd.shutdown()
 
     # 要件5: 同一支払いの別resource再利用を拒否
