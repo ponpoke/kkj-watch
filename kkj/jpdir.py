@@ -241,6 +241,8 @@ def sync(conn=None, fetch=None):
                      " fail_count=? WHERE id=?",
                      (ts, h, json.dumps(latest, ensure_ascii=False), fc, row["id"]))
         summary[obs["machine_readable"]] = summary.get(obs["machine_readable"], 0) + 1
+        # 1件ごとにcommit: 次のobserve(ネットワークI/O)中に書き込みロックを持ち越さない
+        conn.commit()
     conn.commit()
     out = {"at": ts, "resources": len(SEED), "by_format": summary}
     if own:

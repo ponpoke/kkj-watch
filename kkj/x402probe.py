@@ -354,6 +354,10 @@ def run(budget=DEFAULT_BUDGET, conn=None, delay=REQUEST_DELAY_SEC):
             x402trust.update_score(conn, row["id"])
         except Exception:
             pass
+        # 1件ごとにcommit: 次のプローブ(ネットワークI/O、最大10秒)の間に
+        # 書き込みロックを持ち越さない。サイクル一括commitだと数分間ロックを
+        # 握り続け、APIサーバー側の database is locked の原因になる。
+        conn.commit()
         if delay:
             time.sleep(delay)
     conn.commit()

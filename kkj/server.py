@@ -233,13 +233,19 @@ CREATE TABLE IF NOT EXISTS payment_log (
 
 
 def log_payment_attempt(conn, client, resource, success, error):
-    """X-PAYMENT付きリクエスト(=支払い試行)を成否・失敗理由込みで記録"""
-    conn.executescript(PAYMENT_LOG_SCHEMA)
-    conn.execute(
-        "INSERT INTO payment_log(at, client, resource, success, error) VALUES (?,?,?,?,?)",
-        (store.now_utc(), client, resource, 1 if success else 0, error),
-    )
-    conn.commit()
+    """X-PAYMENT付きリクエスト(=支払い試行)を成否・失敗理由込みで記録。
+    settle成立後に呼ばれるため、記録失敗(ロック等)で応答を殺してはならない:
+    支払い済みの客に500を返し、かつ冪等記録前なので再試行でも救済されなくなる。
+    決済の正はオンチェーン/paid_jobs側にあり、このログはベストエフォート。"""
+    try:
+        conn.executescript(PAYMENT_LOG_SCHEMA)
+        conn.execute(
+            "INSERT INTO payment_log(at, client, resource, success, error) VALUES (?,?,?,?,?)",
+            (store.now_utc(), client, resource, 1 if success else 0, error),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 import re as _re
@@ -269,17 +275,23 @@ def classify_usage(path, user_agent, query_has_filter):
 
 
 def log_usage(conn, client, user_agent, path, query_has_filter=False, is_test=False):
-    conn.executescript(USAGE_SCHEMA)
+    """アクセス計測(ベストエフォート)。バッチ巡回とロック競合しても
+    リクエスト本体を殺さない: 計測1行の欠落 < リクエスト失敗。"""
+    uclass = "test" if is_test else classify_usage(path, user_agent, query_has_filter)
     try:
-        conn.execute("ALTER TABLE usage_log ADD COLUMN usage_class TEXT")
+        conn.executescript(USAGE_SCHEMA)
+        try:
+            conn.execute("ALTER TABLE usage_log ADD COLUMN usage_class TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
+        conn.execute(
+            "INSERT INTO usage_log(at, client, user_agent, path, usage_class) VALUES (?,?,?,?,?)",
+            (store.now_utc(), client, user_agent, path, uclass),
+        )
+        conn.commit()
     except sqlite3.OperationalError:
         pass
-    uclass = "test" if is_test else classify_usage(path, user_agent, query_has_filter)
-    conn.execute(
-        "INSERT INTO usage_log(at, client, user_agent, path, usage_class) VALUES (?,?,?,?,?)",
-        (store.now_utc(), client, user_agent, path, uclass),
-    )
-    conn.commit()
 
 
 def usage_stats(conn):
