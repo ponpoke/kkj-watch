@@ -31,6 +31,42 @@ FACILITATOR = {
     "base-sepolia": "https://x402.org/facilitator",
 }
 
+# CDPファシリテータは2026-07からCAIP-2形式のネットワークIDのみ受理
+# (旧表記"base"はスキーマ400で拒否される。402応答では互換性のため旧表記を維持し、
+#  ファシリテータとの通信時のみ正規化する)
+CAIP2_NETWORK = {"base": "eip155:8453", "base-sepolia": "eip155:84532"}
+
+
+def _caip2(net):
+    return CAIP2_NETWORK.get(net or "", net or "")
+
+
+def _v2_requirements(req: dict) -> dict:
+    """CDPの新スキーマ(x402V2PaymentRequirements)向け正規化:
+    network=CAIP-2 + 'amount'必須(V1のmaxAmountRequiredと同値)。
+    402応答は互換性のためV1表記のまま、ファシリテータ送信時のみ変換する。"""
+    out = {**req, "network": _caip2(req.get("network"))}
+    if "amount" not in out and out.get("maxAmountRequired"):
+        out["amount"] = out["maxAmountRequired"]
+    return out
+
+
+def _v2_envelope(payment: dict, requirements: dict) -> dict:
+    """CDPファシリテータ(2026-07以降)が受理するx402 V2エンベロープを組む。
+    実測: V1形式(network='base')は外側スキーマで拒否、CAIP-2化だけの
+    V1エンベロープは内側ルーティング(invalid_network)で拒否。
+    V2 = CAIP-2 + requirements側'amount' + payload側'accepted'(選択条件のエコー)。
+    EIP-3009署名はネットワーク文字列を含まないため変換は署名検証に影響しない。"""
+    reqs2 = _v2_requirements(requirements)
+    pay2 = {
+        "x402Version": 2,
+        "scheme": payment.get("scheme", "exact"),
+        "network": reqs2["network"],
+        "payload": payment.get("payload"),
+        "accepted": reqs2,
+    }
+    return {"x402Version": 2, "paymentPayload": pay2, "paymentRequirements": reqs2}
+
 
 def config():
     return {
@@ -73,7 +109,8 @@ def body_402(requirements: dict, error="X-PAYMENT header is required", free=None
 
 
 def _cdp_jwt(method: str, path: str) -> str:
-    """CDPファシリテータ用JWT(ES256)。PyJWT+cryptographyが必要(メインネットのみ)"""
+    """CDPファシリテータ用JWT。旧型キー(EC DER→ES256)と新型キー(Ed25519→EdDSA)の
+    両対応。PyJWT+cryptographyが必要(メインネットのみ)"""
     import jwt  # lazy import
     key_id = os.environ["CDP_API_KEY_ID"]
     secret = os.environ["CDP_API_KEY_SECRET"]
@@ -84,9 +121,17 @@ def _cdp_jwt(method: str, path: str) -> str:
         "uris": [f"{method} api.cdp.coinbase.com{path}"],
     }
     key = base64.b64decode(secret)
-    from cryptography.hazmat.primitives.serialization import load_der_private_key
-    pk = load_der_private_key(key, password=None)
-    return jwt.encode(claims, pk, algorithm="ES256", headers={"kid": key_id, "nonce": os.urandom(8).hex()})
+    try:
+        from cryptography.hazmat.primitives.serialization import load_der_private_key
+        pk = load_der_private_key(key, password=None)
+        alg = "ES256"
+    except Exception:
+        # 新型CDPキー: base64の生Ed25519(先頭32バイトがseed)
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        pk = Ed25519PrivateKey.from_private_bytes(key[:32])
+        alg = "EdDSA"
+    return jwt.encode(claims, pk, algorithm=alg,
+                      headers={"kid": key_id, "nonce": os.urandom(8).hex()})
 
 
 def _facilitator_post(endpoint: str, payload: dict) -> dict:
@@ -98,28 +143,13 @@ def _facilitator_post(endpoint: str, payload: dict) -> dict:
         path = url.split("api.cdp.coinbase.com", 1)[1]
         headers["Authorization"] = f"Bearer {_cdp_jwt('POST', path)}"
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        return json.loads(resp.read())
-
-
-def _sdk_verify_settle(payment_dict: dict, req_dict: dict):
-    """x402 SDK + CDP認証ファシリテータ(base / base-sepolia両対応)"""
-    import x402
-    from x402.http import HTTPFacilitatorClientSync
-    from cdp.x402 import create_facilitator_config
-    cfg = create_facilitator_config(
-        os.environ["CDP_API_KEY_ID"], os.environ["CDP_API_KEY_SECRET"])
-    fc = HTTPFacilitatorClientSync(cfg)
-    payload = x402.parse_payment_payload(payment_dict)
-    reqs = x402.PaymentRequirementsV1.model_validate(req_dict)
-    v = fc.verify(payload, reqs)
-    if not getattr(v, "is_valid", False):
-        return False, f"verify failed: {getattr(v, 'invalid_reason', v)}"
-    s = fc.settle(payload, reqs)
-    if not getattr(s, "success", False):
-        return False, f"settle failed: {getattr(s, 'error_reason', s)}"
-    return True, base64.b64encode(
-        s.model_dump_json(by_alias=True).encode()).decode()
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # 4xx/5xxの本文(スキーマエラー詳細)を握りつぶさない
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"facilitator {endpoint} {e.code}: {detail}") from None
 
 
 def verify_and_settle(x_payment_b64: str, requirements: dict):
@@ -128,24 +158,23 @@ def verify_and_settle(x_payment_b64: str, requirements: dict):
         payment = json.loads(base64.b64decode(x_payment_b64))
     except Exception:
         return False, "invalid X-PAYMENT encoding"
-    # 第1候補: x402 SDK + CDPファシリテータ(要 venv実行 + CDPキー)
-    if os.environ.get("CDP_API_KEY_ID"):
-        try:
-            return _sdk_verify_settle(payment, requirements)
-        except ImportError:
-            pass  # SDK無し → レガシー経路へ
-        except Exception as e:
-            return False, f"facilitator error: {e}"
-    # 第2候補: 素のHTTP(x402.orgテストネットファシリテータ等)
-    envelope = {
-        "x402Version": 1,
-        "paymentPayload": payment,
-        "paymentRequirements": requirements,
-    }
+    # base(メインネットCDP): V2エンベロープの素HTTP。x402 SDKは2026-07のCDP
+    # スキーマ変更(V1拒否)に追従しておらず使わない。
+    # base-sepolia(x402.orgテストネット): 従来のV1エンベロープ。
+    cfg = config()
+    if cfg["network"] == "base":
+        envelope = _v2_envelope(payment, requirements)
+    else:
+        envelope = {
+            "x402Version": 1,
+            "paymentPayload": payment,
+            "paymentRequirements": requirements,
+        }
     try:
         v = _facilitator_post("verify", envelope)
         if not v.get("isValid"):
-            return False, f"verify failed: {v.get('invalidReason', 'unknown')}"
+            return False, (f"verify failed: {v.get('invalidReason', 'unknown')}"
+                           f" {v.get('invalidMessage', '')}").strip()
         s = _facilitator_post("settle", envelope)
         if not s.get("success"):
             return False, f"settle failed: {s.get('errorReason', s.get('error', 'unknown'))}"
