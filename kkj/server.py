@@ -96,6 +96,8 @@ Probes are GET-only, never pay, never follow redirects, and only target Bazaar-l
 - GET /events?tag=deadline_affecting : filter by impact (deadline_affecting | eligibility_affecting |
   price_affecting | document_affecting | qa_related | cancellation | postponement)
 - GET /cases?query=cloud : free keyword search of monitored tenders (returns case keys)
+- GET /cases?purchasable=1&limit=20 : newest tenders whose structured requirements are already
+  cached — every key returned is INSTANTLY purchasable at /paid/requirements/{key} ($0.02, no 409)
 - GET /cases/{key} : full evidence for one tender (snapshot history + change events + cached requirements if any)
 - GET /sample-diff : one representative change event
 - GET /agent.json : machine-readable discovery of all endpoints / GET /openapi.json : OpenAPI 3.1
@@ -106,6 +108,11 @@ Probes are GET-only, never pay, never follow redirects, and only target Bazaar-l
   $0.02 via x402 (USDC on Base). Returns 402 only if a cached extraction exists; otherwise 409 (use analyze-now).
 - GET /paid/analyze-now/{key} : run a fresh LLM extraction on demand. $0.30 via x402.
   Use only when no cached extraction exists (i.e. /paid/requirements returned 409 cache_not_available).
+
+Buy recipe (3 steps, no account, no 409 dead-ends):
+  1. GET /cases?purchasable=1&limit=20  (free) -> pick items[].key
+  2. GET /paid/requirements/{key}       -> 402 + paymentRequirements ($0.02 USDC on Base)
+  3. retry with X-PAYMENT header        -> 200 + validated requirements JSON + retry_token
 
 x402 flow: GET (no X-PAYMENT) -> 402 + paymentRequirements (with free_alternatives) -> sign EIP-3009 ->
 retry with X-PAYMENT header -> 200 + JSON (+ retry_token for re-fetch without re-paying).
@@ -683,10 +690,30 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 self._json(out)
             elif path == "/cases":
-                rows = conn.execute(
-                    "SELECT * FROM cases ORDER BY first_seen DESC LIMIT ?", (limit,)
-                ).fetchall()
-                self._json([case_summary(r) for r in rows])
+                # query=: llms.txt/agent.jsonで案内している無料キーワード検索
+                # purchasable=1: 抽出キャッシュ済み=即$0.02で購入可能なキーのみ
+                #   (エージェントが409のドン詰まりに当たらない発見導線)
+                q = (qs.get("query") or qs.get("q") or [""])[0].strip()
+                sql = "SELECT c.* FROM cases c"
+                where, params = [], []
+                if (qs.get("purchasable") or [""])[0] in ("1", "true"):
+                    sql += " JOIN extractions x ON x.case_key = c.key"
+                if q:
+                    where.append("c.latest_json LIKE ?")
+                    params.append(f"%{q}%")
+                if where:
+                    sql += " WHERE " + " AND ".join(where)
+                sql += " ORDER BY c.first_seen DESC LIMIT ?"
+                params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
+                extracted = {r["case_key"] for r in conn.execute(
+                    "SELECT case_key FROM extractions")} if rows else set()
+                out = []
+                for r in rows:
+                    s = case_summary(r)
+                    s["purchasable"] = r["key"] in extracted
+                    out.append(s)
+                self._json(out)
             elif path.startswith("/cases/"):
                 key = urllib.parse.unquote(path[len("/cases/"):])
                 row = conn.execute("SELECT * FROM cases WHERE key=?", (key,)).fetchone()
@@ -934,6 +961,8 @@ class Handler(BaseHTTPRequestHandler):
                 "recent_changes": f"{base}/events",
                 "filter_by_impact": f"{base}/events?tag=deadline_affecting",
                 "tender_search": f"{base}/cases?query=cloud",
+                "tender_purchasable_keys": f"{base}/cases?purchasable=1&limit=20 — every key is "
+                                           "instantly deliverable at /paid/requirements/{key} ($0.02)",
                 "sample": f"{base}/sample-diff",
                 "evidence_page": f"{base}/case/{{key}}",
                 "x402_select_best": f"{base}/x402/best?q=web+search&max_price_usd=0.01&min_trust=80",
@@ -2130,7 +2159,9 @@ class Handler(BaseHTTPRequestHandler):
             "servers": [{"url": base}],
             "paths": {
                 "/events": op("Japanese procurement change events (free)", ["tag", "limit"]),
-                "/cases": op("Search monitored tenders (free)", ["query", "limit"]),
+                "/cases": op("Search monitored tenders (free). purchasable=1 returns only keys "
+                             "instantly deliverable at /paid/requirements/{key}",
+                             ["query", "limit", "purchasable"]),
                 "/cases/{key}": op("Full evidence for one tender (free)"),
                 "/sample-diff": op("Sample procurement change event (free)"),
                 "/x402/changes": op("x402 Bazaar registry change events (free)",
@@ -2214,7 +2245,8 @@ class Handler(BaseHTTPRequestHandler):
                 f"{base}/paid/requirements/latest",
                 "Structured bidding requirements for the newest Japanese government tender "
                 "(qualifications, rank A-D, documents, deadlines) as JSON. "
-                f"Replace 'latest' with any case key from {base}/cases (free).",
+                f"Replace 'latest' with any case key from {base}/cases?purchasable=1 (free; "
+                "every key listed there is instantly deliverable for $0.02).",
                 output_schema={"input": {"type": "http", "method": "GET"},
                                "output": extractor.EXTRACT_SCHEMA},
             )
@@ -2602,7 +2634,10 @@ a{{color:#0a6}}</style></head><body>
                 "error": "cache_not_available",
                 "hint": "この案件はまだ構造化されていません。支払いは不要です。"
                         "新規解析が必要な場合は /paid/analyze-now/{key} ($0.30)、"
-                        "無料の生データは /cases/{key} をご利用ください。",
+                        "無料の生データは /cases/{key} をご利用ください。"
+                        " / Not yet extracted — no payment taken. Instantly purchasable keys: "
+                        "GET /cases?purchasable=1",
+                "purchasable_keys": f"{base}/cases?purchasable=1&limit=20",
                 "analyze_now": f"{base}/paid/analyze-now/{urllib.parse.quote(key, safe='')}",
                 "free_alternative": f"{base}/cases/{urllib.parse.quote(key, safe='')}",
             }, 409)
@@ -2614,13 +2649,16 @@ a{{color:#0a6}}</style></head><body>
             "qualifications, unified qualification rank (A-D), required certifications, "
             "document checklist, deadlines, bid method — as validated JSON. "
             f"Use path segment 'latest' for the newest tender, or find case keys for free at "
-            f"{base}/cases?limit=20 (field: key). Docs: {base}/llms.txt "
+            f"{base}/cases?purchasable=1&limit=20 (field: key — every key returned there is "
+            f"instantly deliverable for $0.02). Docs: {base}/llms.txt "
             "/ 日本の官公需(入札)案件の応募要件を構造化JSONで返す。",
             output_schema={
                 "input": {
                     "type": "http", "method": "GET",
                     "discovery": {
-                        "how_to_find_keys": f"GET {base}/cases?limit=20 (free, no auth) -> items[].key",
+                        "how_to_find_keys": f"GET {base}/cases?purchasable=1&limit=20 (free, no "
+                                            "auth) -> items[].key — every key returned is "
+                                            "instantly purchasable (cached extraction exists)",
                         "zero_knowledge_option": f"GET {base}/paid/requirements/latest",
                     },
                 },

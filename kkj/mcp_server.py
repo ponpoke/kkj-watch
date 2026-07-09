@@ -148,6 +148,7 @@ def tool_search_cases(args):
            WHERE latest_json LIKE ? ORDER BY first_seen DESC LIMIT ?""",
         (q, limit),
     ).fetchall()
+    extracted = {r["case_key"] for r in conn.execute("SELECT case_key FROM extractions")}
     out = []
     for r in rows:
         rec = json.loads(r["latest_json"])
@@ -157,6 +158,8 @@ def tool_search_cases(args):
             "organization": rec.get("organization_name"),
             "cft_issue_date": rec.get("cft_issue_date"),
             "document_uri": rec.get("document_uri"),
+            # 構造化要件がキャッシュ済み=get_cached_tender_requirementsで即取得可能
+            "requirements_cached": r["key"] in extracted,
         })
     conn.close()
     return out
