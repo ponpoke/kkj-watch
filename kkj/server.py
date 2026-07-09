@@ -36,6 +36,8 @@ hash-chained to the previous day** (tamper-evident; roots published for independ
 so the score is backed by a record you can prove was not back-dated.
 
 - GET /x402/attestations : latest signed daily hash-chain root (free) + verify steps
+- GET /archive : the signed observation archive — what the x402 agent economy looked like,
+  day by day, since the 2026-07-05 genesis checkpoint. Tamper-evident, cannot be back-dated.
 - GET /paid/x402/attest/{id} : $0.02 — signed inclusion proof that a resource's observed record is
   committed to that day's root (evidence you can show a third party / keep in a decision log)
 
@@ -57,6 +59,16 @@ Ed25519-signed hash-chain root and return a signed Merkle inclusion proof.
   a trust score / payTo-mismatch flag next to each x402 resource in your explorer or catalog.
 - GET /badge/x402/{id}.svg : a seller-displayable badge (also .json, shields.io-compatible).
   Sellers: get your copy-paste snippet at GET /x402/claim/{id} — show buyers your observed trust.
+
+### Settle-compatibility risk (2026-07 facilitator schema migration)
+
+The CDP facilitator moved to a V2-only schema in July 2026. Endpoints still serving
+x402Version 1 payment terms with an unpatched V1 integration FAIL verify/settle silently:
+buyers sign, then get errors; sellers see normal traffic and zero revenue. A 402 response
+is NOT proof that settle works. We observed this first-hand (our own settle path was down
+2026-07-08..10 until we migrated). Every /x402/trust/{id} response now includes a
+`settle_compatibility` verdict from live probes; downgrades emit `settle_compat_risk`
+events in /x402/changes. Operators: test end-to-end, then /paid/x402/reverify/{id}.
 
 ### For operators of listed endpoints — flagged? re-verify now (paid)
 
@@ -100,6 +112,19 @@ listing age/stability, and spam-farm detection (one payTo behind dozens of listi
 Why this exists: the x402 protocol re-fetches payment terms at 402 time, so it happily pays a
 hijacked payTo or a silently-10x'd price. Only history + independent live verification catches that.
 Probes are GET-only, never pay, never follow redirects, and only target Bazaar-listed resources.
+
+## MCP Trust Directory — tool-definition drift detection for MCP servers
+
+An MCP server's tool descriptions are instructions your agent will FOLLOW, and the operator
+can change them at any time after you installed it (tool poisoning / rug pull). We fingerprint
+every tool definition (name/description/inputSchema, SHA-256) on public remote MCP servers
+daily — read-only (initialize + tools/list only, never tools/call) — and the whole directory
+state is anchored daily into our Ed25519-signed hash-chain (tamper-evident).
+
+- GET /mcp-trust/directory.json (also .ndjson) : observed liveness / auth / tools_hash per server
+- GET /mcp-trust/e/{id} : per-server record page (tool fingerprints, drift events, probe history)
+- GET /paid/mcp/report/{id} : $0.02 via x402 — full dossier: every probe, every tool-definition
+  snapshot (full text), every drift event (tool_description_changed = the poisoning vector)
 
 ## Japanese procurement watch (free feed)
 
@@ -218,6 +243,8 @@ POST /mcp                  # MCP(Streamable HTTP)。Claude等のエージェン�
 <table>
 <tr><th>x402 Trust Index</th><td><a href="/x402/leaderboard?q=search">leaderboard</a> / <a href="/x402/trust-feed.json">trust-feed.json</a> / <a href="/x402/changes">changes</a> — 23,000+ x402エンドポイントの観測trust・payTo/価格不一致検知</td></tr>
 <tr><th>日本エージェント資源目録</th><td><a href="/jp/directory.json">directory.json</a> — 公的データAPI等の稼働・機械可読性・スキーマ指紋を検証</td></tr>
+<tr><th>MCP Trust Directory</th><td><a href="/mcp-trust/directory.json">mcp-trust/directory.json</a> — リモートMCPサーバーのツール定義ドリフト(説明文すり替え=tool poisoning)を日次指紋で検知</td></tr>
+<tr><th>署名アーカイブ</th><td><a href="/archive">/archive</a> — x402経済の日次観測を2026-07-05起点で署名チェーン化(改竄不能・後付け不可の一次記録)</td></tr>
 <tr><th>署名アテステーション</th><td><a href="/x402/attestations">attestations</a> / <a href="/witness">existence proof</a> — 日次Ed25519署名ハッシュチェーン</td></tr>
 <tr><th>エージェント向け導線</th><td><a href="/llms.txt">llms.txt</a> / <a href="/agent.json">agent.json</a> / <a href="/openapi.json">openapi.json</a> / <a href="/.well-known/witness">identity</a> / <code>POST /mcp</code></td></tr>
 <tr><th>安全決済</th><td><a href="https://github.com/ponpoke/kkj-watch">x402guard</a> — 支払い直前にTrustを1行チェックするミドルウェア(OSS)</td></tr>
@@ -356,6 +383,7 @@ def usage_stats(conn):
             "entity_pages": surface("/x402/e/"),
             "badges": surface("/badge/"),
             "claim": surface("/x402/claim/"),
+            "mcp_trust": surface("/mcp-trust/"),
             "paid_attest": surface("/paid/x402/attest/"),
             "witness_anchor": surface("/witness/anchor"),
         },
@@ -530,6 +558,7 @@ code,pre{{background:#f4f4f4;border-radius:4px;padding:.1rem .3rem;font-size:.85
 <tr><th>listing vs live</th><td>{_h(v.get('listing_matches_live'))}</td></tr>
 <tr><th>payTo</th><td>{_h(payto_status)}</td></tr>
 <tr><th>spam-farm payTo</th><td>{_h(v.get('farm_member'))}</td></tr>
+<tr><th>settle compatibility</th><td>{('<span class="warn">x402Version 1 terms — facilitator moved to V2-only (2026-07); unpatched V1 integrations fail settle silently</span>' if (d.get('settle_compat') or {}).get('status') == 'v1_risk' else _h((d.get('settle_compat') or {}).get('status') or 'unknown'))}</td></tr>
 <tr><th>active listing</th><td>{_h(v.get('active_listing'))}</td></tr>
 <tr><th>first observed</th><td>{_h((d['first_seen'] or '')[:10])}</td></tr>
 <tr><th>snapshots</th><td>{d['snapshot_count']}</td></tr></table>
@@ -560,6 +589,97 @@ under <a href="{DATA_LICENSE_URL}">{DATA_LICENSE}</a>, provided attribution to k
 <footer class="muted"><hr>Observed by <a href="{base}/">kkj-watch</a> — x402 registry change detection &amp;
 observed trust, backed by daily Ed25519-signed hash-chain roots. Risk indicator, not a guarantee.
 Verify payment terms yourself before paying. Identity: <a href="{base}/.well-known/witness">/.well-known/witness</a></footer>
+</body></html>"""
+
+
+def _render_mcp_entity(base, d, indexable):
+    """MCPサーバー1件の公開リファレンスページ(観測事実のみ・誇張なし)"""
+    canonical = f"{base}/mcp-trust/e/{d['id']}"
+    name = d["name"] or d["url"]
+    obs = d.get("observed", {})
+    robots = "index,follow" if indexable else "noindex,follow"
+    cite = f"{name} MCP server — observed by kkj-watch <{canonical}>"
+    ld = {
+        "@context": "https://schema.org", "@type": "Dataset",
+        "name": f"{name} — observed MCP server record",
+        "url": canonical, "license": DATA_LICENSE_URL, "citation": cite,
+        "dateModified": d["last_seen"],
+        "creator": {"@type": "Organization", "name": "kkj-watch", "url": base},
+        "about": {"@type": "WebAPI", "name": name, "url": d["url"],
+                  "provider": {"@type": "Organization", "name": d["provider"]}},
+        "variableMeasured": [
+            {"@type": "PropertyValue", "name": "observed_alive", "value": str(obs.get("alive"))},
+            {"@type": "PropertyValue", "name": "is_mcp", "value": str(obs.get("is_mcp"))},
+            {"@type": "PropertyValue", "name": "auth", "value": obs.get("auth")},
+            {"@type": "PropertyValue", "name": "tools_hash",
+             "value": obs.get("tools_hash")},
+        ],
+    }
+    tool_rows = "".join(
+        f"<tr><td><code>{_h(t['name'])}</code></td>"
+        f"<td><code>{_h(t['sha256'][:16])}…</code></td>"
+        f"<td><code>{_h(t['description_sha256'][:16])}…</code></td></tr>"
+        for t in (obs.get("tools") or [])) or "<tr><td colspan=3>no tools observed</td></tr>"
+    event_rows = "".join(
+        f"<tr><td>{_h(e['detected_at'][:19])}</td><td>{_h(e['event_type'])}</td>"
+        f"<td>{_h(e['severity'])}</td></tr>" for e in d["events"][:10]) \
+        or "<tr><td colspan=3>no drift events observed yet</td></tr>"
+    probe_rows = "".join(
+        f"<tr><td>{_h(p['probed_at'][:19])}</td><td>{'up' if p['alive'] else 'down'}</td>"
+        f"<td>{_h(p['auth_observed'])}</td><td>{_h(p['tools_count'])}</td>"
+        f"<td><code>{_h((p['tools_hash'] or '')[:12])}</code></td></tr>"
+        for p in d["probes"]) or "<tr><td colspan=5>not probed yet</td></tr>"
+    dig = d.get("latest_digest") or {}
+    dig_line = (f'Directory state anchored {_h(dig["date"])} into the signed daily '
+                f'hash-chain: <a href="{base}/witness/proof/{_h(dig["digest"])}">proof</a>'
+                if dig else "Not yet anchored.")
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="{robots}">
+<link rel="canonical" href="{_h(canonical)}">
+<title>MCP server observed record: {_h(name)} — kkj-watch</title>
+<meta name="description" content="Observed liveness and tool-definition drift record for the MCP server {_h(d['url'])}. Tool descriptions are instructions your agent follows — a silent change is the tool-poisoning vector. Observation-based; not a guarantee.">
+<script type="application/ld+json">{json.dumps(ld, ensure_ascii=False)}</script>
+<style>body{{font-family:system-ui,sans-serif;max-width:820px;margin:2rem auto;padding:0 1rem;line-height:1.6;color:#222}}
+h1{{font-size:1.3rem}} h2{{font-size:1.05rem;margin-top:1.6rem;border-left:4px solid #06c;padding-left:.5rem}}
+table{{border-collapse:collapse;width:100%;font-size:.9rem}} td,th{{border:1px solid #ddd;padding:.3rem .5rem;text-align:left}}
+code{{background:#f4f4f4;border-radius:4px;padding:.1rem .3rem;font-size:.85em}}
+.muted{{color:#888;font-size:.85rem}} .warn{{color:#c0392b}}</style>
+</head><body>
+<h1>MCP server observed record — {_h(name)}</h1>
+<p class="muted">Endpoint: <code>{_h(d['url'])}</code> · provider: {_h(d['provider'])} ·
+<a href="{_h(d['docs'] or '#')}">docs</a></p>
+<p class="muted"><strong>Why this page exists:</strong> an MCP server's tool descriptions are
+instructions your agent will follow, and the operator can change them at ANY time after you
+installed it (tool poisoning / rug pull). This record fingerprints every tool definition daily
+so you can verify "did anything change since I last trusted this?" — observation-based,
+not a guarantee.</p>
+<h2>Latest observation</h2>
+<table><tr><th>reachable</th><td>{_h(obs.get('alive'))}</td></tr>
+<tr><th>speaks MCP</th><td>{_h(obs.get('is_mcp'))}</td></tr>
+<tr><th>auth</th><td>{_h(obs.get('auth'))}</td></tr>
+<tr><th>protocol</th><td>{_h(obs.get('protocol_version'))}</td></tr>
+<tr><th>server version</th><td>{_h(obs.get('server_version'))}</td></tr>
+<tr><th>tools</th><td>{len(obs.get('tools') or [])}</td></tr>
+<tr><th>tools_hash</th><td><code>{_h((obs.get('tools_hash') or '')[:16])}…</code></td></tr>
+<tr><th>last verified</th><td>{_h((d['last_seen'] or '')[:19])}</td></tr></table>
+<h2>Tool definition fingerprints</h2>
+<table><tr><th>tool</th><th>definition sha256</th><th>description sha256</th></tr>{tool_rows}</table>
+<h2>Drift events (tool_description_changed = tool-poisoning vector)</h2>
+<table><tr><th>at</th><th>event</th><th>severity</th></tr>{event_rows}</table>
+<h2>Probe history (read-only: initialize + tools/list, never tools/call)</h2>
+<table><tr><th>at</th><th>reachability</th><th>auth</th><th>tools</th><th>tools_hash</th></tr>{probe_rows}</table>
+<h2>Tamper evidence</h2><p class="muted">{dig_line}</p>
+<h2>Machine access</h2>
+<p><a href="{base}/mcp-trust/directory.json">directory.json</a> ·
+<a href="{base}/paid/mcp/report/{d['id']}">full dossier ($0.02, x402)</a></p>
+<h2>Cite / reuse (free, attribution required)</h2>
+<p class="muted">Free to use and redistribute, including by AI agents and in model training,
+under <a href="{DATA_LICENSE_URL}">{DATA_LICENSE}</a>, provided attribution to kkj-watch is preserved.</p>
+<pre>{_h(cite)}</pre>
+<footer class="muted"><hr>Observed by <a href="{base}/">kkj-watch</a> — MCP tool-definition
+drift detection, backed by daily Ed25519-signed hash-chain roots. Risk indicator, not a
+guarantee. Identity: <a href="{base}/.well-known/witness">/.well-known/witness</a></footer>
 </body></html>"""
 
 
@@ -786,6 +906,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._paid_x402_reverify(conn, path)
             elif path == "/x402/attestations":
                 self._x402_attestations(conn)
+            elif path == "/archive":
+                self._archive(conn)
             elif path.startswith("/badge/x402/"):
                 self._x402_badge(conn, path)
             elif path.startswith("/x402/claim/"):
@@ -800,6 +922,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._x402_entity_page(conn, path)
             elif path == "/sitemap-x402.xml":
                 self._sitemap_x402(conn)
+            elif path in ("/mcp-trust/directory.json", "/mcp-trust/directory.ndjson"):
+                self._mcp_directory(conn, "ndjson" if path.endswith(".ndjson") else "json")
+            elif path.startswith("/mcp-trust/e/"):
+                self._mcp_entity_page(conn, path)
+            elif path == "/sitemap-mcp.xml":
+                self._sitemap_mcp(conn)
+            elif path.startswith("/paid/mcp/report/"):
+                self._paid_mcp_report(conn, path)
             elif path in ("/jp/directory.json", "/jp/directory.ndjson"):
                 self._jp_directory(conn, "ndjson" if path.endswith(".ndjson") else "json")
             elif path.startswith("/jp/e/"):
@@ -819,6 +949,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = (f"User-agent: *\nAllow: /\n"
                         f"Sitemap: {base}/sitemap.xml\nSitemap: {base}/sitemap-x402.xml\n"
                         f"Sitemap: {base}/sitemap-jp.xml\n"
+                        f"Sitemap: {base}/sitemap-mcp.xml\n"
                         f"# AI agents: {base}/llms.txt and {base}/.well-known/x402.json\n").encode()
                 self._raw(body, "text/plain; charset=utf-8")
             elif path in ("/.well-known/x402", "/.well-known/x402.json"):
@@ -1011,11 +1142,45 @@ class Handler(BaseHTTPRequestHandler):
 
     X402_EVENT_TYPES = ["price_changed", "payto_changed", "accepts_changed",
                         "schema_changed", "description_changed",
-                        "new_resource", "delisted", "relisted"]
+                        "new_resource", "delisted", "relisted",
+                        "settle_compat_risk", "settle_compat_ok"]
 
     # 運営者に是正/確認のアクションがあるイベント(フィード上でreverify導線を出す)
     X402_FLAG_EVENTS = ("live_payto_mismatch", "live_price_mismatch", "endpoint_dead",
-                        "payto_changed", "price_changed", "not_x402", "delisted")
+                        "payto_changed", "price_changed", "not_x402", "delisted",
+                        "settle_compat_risk")
+
+    def _x402_settle_compat(self, conn, rid):
+        """read-time判定: 最新プローブのlive x402Versionからsettle互換性リスクを返す。
+        CDPファシリテータは2026-07にV2専用スキーマへ移行し、未更新のV1統合は
+        settleが黙って失敗する(当サービス自身が7/8-7/10にこれで全決済停止していた実話)。
+        402が返ること自体はsettleが動く証明にならない。"""
+        try:
+            p = conn.execute(
+                "SELECT is_402, live_x402_version FROM x402_probes WHERE resource_id=?"
+                " ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
+        except Exception:
+            return None
+        if p is None or not p["is_402"]:
+            return None
+        try:
+            ver = p["live_x402_version"]
+        except (KeyError, IndexError):
+            return None
+        base = self._base_url()
+        if ver is not None and ver >= 2:
+            return {"status": "v2_ok", "live_x402Version": ver,
+                    "note": "Serves x402Version 2 payment terms (current facilitator schema)."}
+        return {
+            "status": "v1_risk", "live_x402Version": ver,
+            "note": "Serves x402Version 1 (or unversioned) payment terms. The CDP "
+                    "facilitator moved to a V2-only schema in 2026-07; unpatched V1 "
+                    "integrations fail verify/settle silently - buyers get errors AFTER "
+                    "signing. A 402 response is NOT proof that settle works. Operators: "
+                    "test your payment path end-to-end.",
+            "operator_action": f"{base}/paid/x402/reverify/{rid} ($0.25): fixed your "
+                               "integration? Instant re-probe + fresh public evidence.",
+        }
 
     def _x402_free_hint(self):
         base = self._base_url()
@@ -1214,6 +1379,7 @@ class Handler(BaseHTTPRequestHandler):
             "disclaimer": x402trust.SCORE_DISCLAIMER,
             "observed_trust_score": trust.get("score"),
             "trust": trust,
+            "settle_compatibility": self._x402_settle_compat(conn, row["id"]),
             "latest_attestation_available": latest_attestation,
             "how_scored": "Deterministic, versioned formula over observed registry history "
                           "(hourly Bazaar sync since 2026-07) and live GET-only probes. "
@@ -1472,6 +1638,7 @@ class Handler(BaseHTTPRequestHandler):
             "first_seen": row["first_seen"], "last_seen": row["last_seen"],
             "trust_score": _row_get(row, "trust_score"),
             "grade": trust.get("grade"), "verdicts": trust.get("verdicts", {}) or {},
+            "settle_compat": self._x402_settle_compat(conn, rid),
             "reasons": trust.get("reasons", []),
             "last_verified_at": trust.get("last_verified_at"),
             "prices": prices, "events": events, "probes": probes,
@@ -1637,6 +1804,194 @@ class Handler(BaseHTTPRequestHandler):
                 '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
                 + "\n".join(urls) + "\n</urlset>\n").encode("utf-8")
         self._raw_cached(body, "application/xml; charset=utf-8", 3600)
+
+    # ---- MCP Trust Directory(公開リモートMCPサーバーの観測目録) ----
+
+    def _mcp_data(self, conn, row):
+        from . import mcpdir
+        conn.executescript(mcpdir.SCHEMA_SQL)
+        latest = json.loads(row["latest_json"]) if row["latest_json"] else {}
+        probes = [{"probed_at": p["probed_at"], "alive": bool(p["alive"]),
+                   "http_status": p["http_status"], "auth_observed": p["auth_observed"],
+                   "is_mcp": bool(p["is_mcp"]), "protocol_version": p["protocol_version"],
+                   "server_version": p["server_version"], "tools_count": p["tools_count"],
+                   "tools_hash": p["tools_hash"], "latency_ms": p["latency_ms"]}
+                  for p in conn.execute(
+                      "SELECT * FROM mcp_probes WHERE resource_id=? ORDER BY id DESC LIMIT 8",
+                      (row["id"],)).fetchall()]
+        events = [{"event_type": e["event_type"], "severity": e["severity"],
+                   "detected_at": e["detected_at"],
+                   "detail": json.loads(e["detail_json"]) if e["detail_json"] else None}
+                  for e in conn.execute(
+                      "SELECT * FROM mcp_events WHERE resource_id=? ORDER BY id DESC LIMIT 10",
+                      (row["id"],)).fetchall()]
+        dig = conn.execute("SELECT * FROM mcp_digests ORDER BY date DESC LIMIT 1").fetchone()
+        return {
+            "id": row["id"], "url": row["url"], "name": row["name"],
+            "provider": row["provider"], "docs": row["docs"],
+            "observed": latest, "first_seen": row["first_seen"], "last_seen": row["last_seen"],
+            "active": bool(row["active"]), "probes": probes, "events": events,
+            "latest_digest": ({"date": dig["date"], "digest": dig["digest"]} if dig else None),
+        }
+
+    def _mcp_directory(self, conn, fmt):
+        from . import mcpdir
+        conn.executescript(mcpdir.SCHEMA_SQL)
+        base = self._base_url()
+        rows = conn.execute("SELECT * FROM mcp_resources ORDER BY id").fetchall()
+
+        def rec(r):
+            latest = json.loads(r["latest_json"]) if r["latest_json"] else {}
+            return {
+                "id": r["id"], "name": r["name"], "provider": r["provider"],
+                "url": r["url"], "docs": r["docs"],
+                "observed_alive": latest.get("alive"),
+                "is_mcp": latest.get("is_mcp"),
+                "auth": latest.get("auth"),
+                "protocol_version": latest.get("protocol_version"),
+                "tools_count": len(latest.get("tools") or []) or None,
+                "tools_hash": latest.get("tools_hash"),
+                "last_verified_at": r["last_seen"],
+                "detail_url": f"{base}/mcp-trust/e/{r['id']}",
+                "cite_as": f"{r['name']} MCP server — observed by kkj-watch "
+                           f"<{base}/mcp-trust/e/{r['id']}>",
+            }
+        dig = conn.execute("SELECT * FROM mcp_digests ORDER BY date DESC LIMIT 1").fetchone()
+        if fmt == "ndjson":
+            lines = "\n".join(json.dumps(rec(r), ensure_ascii=False) for r in rows)
+            self._raw_cached((lines + "\n").encode("utf-8"),
+                             "application/x-ndjson; charset=utf-8", 1800)
+            return
+        self._json_cached({
+            "service": "kkj-watch MCP Trust Directory",
+            "description": "Observed liveness + tool-definition drift for public remote MCP "
+                           "servers. Each tool definition (name/description/inputSchema) is "
+                           "SHA-256 fingerprinted daily; a changed description is the "
+                           "tool-poisoning / rug-pull vector agents cannot see by themselves. "
+                           "Probes are read-only (initialize + tools/list only, never "
+                           "tools/call). Observation-based risk indicator, not a guarantee.",
+            "why_this_matters": "An MCP server's tool descriptions are instructions your "
+                                "agent will follow. The operator can change them at any time "
+                                "after you installed it. This directory lets you verify "
+                                "'did anything change since I last trusted this?'",
+            "count": len(rows),
+            "items": [rec(r) for r in rows],
+            "daily_digest_anchor": ({
+                "date": dig["date"], "sha256": dig["digest"],
+                "proof": f"{base}/witness/proof/{dig['digest']}",
+                "note": "The whole directory state is hashed daily and anchored into our "
+                        "Ed25519-signed hash-chain root — observations cannot be re-written "
+                        "after the fact.",
+            } if dig else None),
+            "provenance": _provenance(base, f"{base}/mcp-trust/directory.json",
+                                      "MCP server trust directory"),
+            "docs": f"{base}/llms.txt",
+        }, 1800)
+
+    def _mcp_entity_page(self, conn, path):
+        from . import mcpdir
+        conn.executescript(mcpdir.SCHEMA_SQL)
+        ident = urllib.parse.unquote(path[len("/mcp-trust/e/"):])
+        row = None
+        if ident.isdigit():
+            row = conn.execute("SELECT * FROM mcp_resources WHERE id=?",
+                               (int(ident),)).fetchone()
+        if row is None:
+            self._raw(b"<!doctype html><meta name='robots' content='noindex'>"
+                      b"<title>Not found</title>", "text/html; charset=utf-8", 404)
+            return
+        d = self._mcp_data(conn, row)
+        indexable = bool(d["probes"])      # 実プローブ済みのみindex許可
+        html = _render_mcp_entity(self._base_url(), d, indexable)
+        self._raw_cached(html.encode("utf-8"), "text/html; charset=utf-8", 1800)
+
+    def _sitemap_mcp(self, conn):
+        from . import mcpdir
+        conn.executescript(mcpdir.SCHEMA_SQL)
+        base = self._base_url()
+        urls = []
+        for r in conn.execute(
+                "SELECT r.id, r.last_seen FROM mcp_resources r WHERE r.active=1 AND EXISTS"
+                " (SELECT 1 FROM mcp_probes p WHERE p.resource_id=r.id) ORDER BY r.id").fetchall():
+            lastmod = (r["last_seen"] or "")[:10]
+            urls.append(f"<url><loc>{base}/mcp-trust/e/{r['id']}</loc>"
+                        + (f"<lastmod>{lastmod}</lastmod>" if lastmod else "")
+                        + "<changefreq>daily</changefreq></url>")
+        body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+                + "\n".join(urls) + "\n</urlset>\n").encode("utf-8")
+        self._raw_cached(body, "application/xml; charset=utf-8", 3600)
+
+    def _paid_mcp_report(self, conn, path):
+        """有料($0.02): 1 MCPサーバーの全証跡(全プローブ+ツール定義スナップショット+
+        全イベント)。paid-but-denied防止: 対象なし/プローブ未実施は課金しない"""
+        from . import x402_gate, mcpdir, paid
+        conn.executescript(mcpdir.SCHEMA_SQL)
+        ident = urllib.parse.unquote(path[len("/paid/mcp/report/"):])
+        base = self._base_url()
+        if not x402_gate.available():
+            self._json({"error": "payments_not_configured"}, 503)
+            return
+        row = (conn.execute("SELECT * FROM mcp_resources WHERE id=?", (int(ident),)).fetchone()
+               if ident.isdigit() else None)
+        if row is None:
+            self._json({"error": "not_found",
+                        "hint": f"Directory (free): {base}/mcp-trust/directory.json"}, 404)
+            return
+        if conn.execute("SELECT 1 FROM mcp_probes WHERE resource_id=?",
+                        (row["id"],)).fetchone() is None:
+            self._json({"error": "not_probed_yet",
+                        "hint": "No observations recorded yet. No charge."}, 409)
+            return
+        resource = f"{base}{path}"
+        reqs = x402_gate.payment_requirements(
+            resource,
+            "Full evidence dossier for one public remote MCP server: every probe "
+            "(liveness, auth, protocol/server version), every tool-definition snapshot "
+            "(full name/description/inputSchema with SHA-256 fingerprints) and every "
+            "drift event (tool_description_changed = tool-poisoning vector, added/removed "
+            "tools, version changes). Free summary: "
+            f"{base}/mcp-trust/e/{row['id']}",
+            output_schema={"input": {"type": "http", "method": "GET"}},
+            price_usd=0.02,
+        )
+        job = self._settle_and_claim(conn, reqs, resource, f"mcpr:{row['id']}",
+                                     free_hint={"directory": f"{base}/mcp-trust/directory.json",
+                                                "entity": f"{base}/mcp-trust/e/{row['id']}"})
+        if job is None:
+            return
+        if job["status"] == "succeeded" and job["result_json"]:
+            self._json({"cached": True, "report": json.loads(job["result_json"]),
+                        "retry_token": job["retry_token"]})
+            return
+        d = self._mcp_data(conn, row)
+        d["probes"] = [{k: p[k] for k in p.keys()} for p in conn.execute(
+            "SELECT * FROM mcp_probes WHERE resource_id=? ORDER BY id", (row["id"],)).fetchall()]
+        d["snapshots"] = [{"fetched_at": s["fetched_at"], "tools_hash": s["tools_hash"],
+                           "tools": json.loads(s["tools_json"])}
+                          for s in conn.execute(
+                              "SELECT * FROM mcp_snapshots WHERE resource_id=? ORDER BY id",
+                              (row["id"],)).fetchall()]
+        d["events"] = [{"event_type": e["event_type"], "severity": e["severity"],
+                        "detected_at": e["detected_at"],
+                        "detail": json.loads(e["detail_json"]) if e["detail_json"] else None}
+                       for e in conn.execute(
+                           "SELECT * FROM mcp_events WHERE resource_id=? ORDER BY id",
+                           (row["id"],)).fetchall()]
+        payload = {"service": "kkj-watch MCP Trust Directory — full dossier",
+                   "disclaimer": "Observed, evidence-based record. Not a safety guarantee.",
+                   **d}
+        paid.finish(conn, job["retry_token"], "succeeded", payload)
+        body = json.dumps({"cached": False, "report": payload,
+                           "retry_token": job["retry_token"]},
+                          ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if job["settlement"]:
+            self.send_header("X-PAYMENT-RESPONSE", job["settlement"])
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     # ---- verifiedバッジ(#3: 売り手に自分でTrustを宣伝してもらう) ----
 
@@ -2002,6 +2357,72 @@ class Handler(BaseHTTPRequestHandler):
                         "GitHub for independent, time-stamped verification.")
         self._json(doc)
 
+    def _archive(self, conn):
+        """無料: 署名チェーン・アーカイブの目録と位置づけ。
+        2026-07-05起点の観測記録は後付けで作れない=エージェント経済最初期の
+        改竄不能な第三者記録。今すぐ売る物ではなく、係争・報道・被害立証が
+        必要になった日に価値がつく資産としての公示。"""
+        from . import attest, mcpdir
+        base = self._base_url()
+        attest._init(conn)      # daily_roots + leaves_available列を確実に用意
+        roots = conn.execute(
+            "SELECT date, chain_index, root_hash, previous_root, records_count,"
+            " leaves_available FROM daily_roots ORDER BY chain_index").fetchall()
+        if not roots:
+            self._json({"service": "kkj-watch signed observation archive",
+                        "available": False,
+                        "note": "No signed roots yet."})
+            return
+        genesis = roots[0]
+        latest = roots[-1]
+        span_days = len(roots)
+        total_records = sum(r["records_count"] or 0 for r in roots)
+        try:
+            mcpdir.SCHEMA_SQL and conn.executescript(mcpdir.SCHEMA_SQL)
+            mcp_digests = conn.execute("SELECT COUNT(*) n FROM mcp_digests").fetchone()["n"]
+        except Exception:
+            mcp_digests = 0
+        self._json({
+            "service": "kkj-watch — signed observation archive",
+            "what_this_is": "A daily Ed25519-signed, hash-chained record of what the x402 "
+                            "agent economy looked like — every listed endpoint's payTo, "
+                            "price, schema and liveness — starting at the genesis checkpoint "
+                            "on " + genesis["date"] + ". Each day links to the previous day's "
+                            "root_hash, so the record cannot be back-dated or rewritten.",
+            "why_it_compounds": "These observations cannot be reconstructed after the fact. "
+                                "When a payTo-hijack, a silent reprice or a rug-pull causes "
+                                "real loss, the party that holds the tamper-evident 'what was "
+                                "listed that day' record is the one third parties (victims, "
+                                "press, disputes) must come to. The archive gains value every "
+                                "day at ~23:55 UTC whether or not anyone buys today.",
+            "genesis": {"date": genesis["date"], "root_hash": genesis["root_hash"],
+                        "is_checkpoint": not bool(genesis["leaves_available"])},
+            "latest": {"date": latest["date"], "chain_index": latest["chain_index"],
+                       "root_hash": latest["root_hash"]},
+            "coverage": {
+                "signed_days": span_days,
+                "record_observations_committed": total_records,
+                "mcp_directory_digests": mcp_digests,
+                "domains": ["x402 Bazaar registry (payTo/price/schema/liveness)",
+                            "MCP server tool-definition drift",
+                            "arbitrary sha256 existence anchors (witness)"],
+            },
+            "public_roots": f"{base}/x402/attestations",
+            "github_published_roots": "https://github.com/ponpoke/kkj-watch/tree/main/roots",
+            "verify_yourself": {
+                "latest_root": f"{base}/x402/attestations",
+                "resource_proof": f"{base}/paid/x402/attest/{{id}} ($0.02): signed inclusion "
+                                  "proof for one endpoint's observed record on a given day",
+                "cli": "python -m kkj.attest verify-root <date>",
+            },
+            "identity": f"{base}/.well-known/witness",
+            "disclaimer": "Observation-based, evidence-based record. Not a safety guarantee "
+                          "and not legal notarization; a cryptographic timestamp witness.",
+            "provenance": _provenance(base, f"{base}/archive",
+                                      "kkj-watch signed observation archive",
+                                      latest["root_hash"]),
+        })
+
     # 運営者向け即時再検証: 買えるのは「速度と証拠」だけ。スコアは金で買えない
     X402_REVERIFY_PRICE_USD = 0.25
     X402_REVERIFY_COOLDOWN_SEC = 300
@@ -2014,6 +2435,7 @@ class Handler(BaseHTTPRequestHandler):
         from . import x402_gate, x402watch, x402probe, x402trust, paid
         conn.executescript(x402watch.SCHEMA_SQL)
         conn.executescript(x402probe.SCHEMA_SQL)
+        x402probe._migrate(conn)
         ident = urllib.parse.unquote(path[len("/paid/x402/reverify/"):])
         base = self._base_url()
         if not x402_gate.available():
@@ -2519,7 +2941,7 @@ class Handler(BaseHTTPRequestHandler):
     def _sitemap_index(self, conn):
         """サイトマップインデックス: 全サブサイトマップをクローラに提示"""
         base = self._base_url()
-        subs = ["sitemap-x402.xml", "sitemap-jp.xml", "sitemap-cases.xml"]
+        subs = ["sitemap-x402.xml", "sitemap-jp.xml", "sitemap-mcp.xml", "sitemap-cases.xml"]
         parts = ['<?xml version="1.0" encoding="UTF-8"?>',
                  '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
         for s in subs:

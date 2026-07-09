@@ -182,6 +182,34 @@ def main():
         hosts[h] = hosts.get(h, 0) + 1
     check("ホスト毎3件以内", max(hosts.values()) <= 3, str(hosts))
 
+    print("== settle互換性(x402Version観測) ==")
+    accepts, ver = x402probe.parse_live_402(body_402())
+    check("V1本文からversion=1を抽出", ver == 1 and accepts is not None)
+    v2body = json.dumps({"x402Version": 2, "accepts": [
+        {"scheme": "exact", "network": "eip155:8453", "amount": "1000",
+         "payTo": "0xAAA"}]}).encode()
+    accepts, ver = x402probe.parse_live_402(v2body)
+    check("V2本文からversion=2を抽出", ver == 2 and accepts[0]["amount"] == "1000")
+    check("壊れたJSONは(None,None)", x402probe.parse_live_402(b"<html>") == (None, None))
+
+    x402watch.fetch_pages = lambda: ([item("https://ver.example/x")], True, None)
+    x402watch.sync(conn)
+    vrow = conn.execute("SELECT * FROM x402_resources WHERE resource=?",
+                        ("https://ver.example/x",)).fetchone()
+    ts2 = store.now_utc()
+    set_fetch(402, body_402())                       # 初回観測 V1
+    x402probe.probe_one(conn, vrow, ts2)
+    check("初回V1観測ではイベント無し(洪水防止)",
+          "settle_compat_risk" not in last_events(conn, vrow["resource"]))
+    set_fetch(402, v2body)                           # V1→V2
+    x402probe.probe_one(conn, vrow, ts2)
+    check("V1→V2でsettle_compat_ok",
+          "settle_compat_ok" in last_events(conn, vrow["resource"]))
+    set_fetch(402, body_402())                       # V2→V1 後退
+    x402probe.probe_one(conn, vrow, ts2)
+    check("V2→V1後退でsettle_compat_risk",
+          "settle_compat_risk" in last_events(conn, vrow["resource"]))
+
     conn.close()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

@@ -64,10 +64,19 @@ CREATE TABLE IF NOT EXISTS x402_probes (
     live_accepts_json TEXT,
     consistency TEXT NOT NULL,         -- ok / payto_mismatch / price_mismatch / not_x402 / unreachable / skipped:<reason>
     fail_count INTEGER NOT NULL DEFAULT 0,
-    error TEXT
+    error TEXT,
+    live_x402_version INTEGER          -- 実物402のx402Version(settle互換性判定)
 );
 CREATE INDEX IF NOT EXISTS idx_x402probe_res ON x402_probes(resource_id, id);
 """
+
+
+def _migrate(conn):
+    """既存DBへの列追加(冪等)"""
+    try:
+        conn.execute("ALTER TABLE x402_probes ADD COLUMN live_x402_version INTEGER")
+    except Exception:
+        pass
 
 
 def canon_network(net):
@@ -188,14 +197,19 @@ def fetch(url: str):
                 pass
 
 
-def parse_live_accepts(body: bytes):
-    """402本文からaccepts(価格/payTo/network)を抽出。壊れたJSONはNone"""
+def parse_live_402(body: bytes):
+    """402本文から(accepts, x402Version)を抽出。壊れたJSONは(None, None)。
+    x402VersionはCDPファシリテータの2026-07スキーマ移行後のsettle互換性判定に使う:
+    V1形式しか出さない売り手は、未更新のV1統合だとsettleが全滅している恐れがある。"""
     try:
         d = json.loads(body)
     except Exception:
-        return None
+        return None, None
     if not isinstance(d, dict):        # null / 配列 / 文字列だけの"JSON"を返す実装がある
-        return None
+        return None, None
+    ver = d.get("x402Version")
+    if not isinstance(ver, int):
+        ver = None
     out = []
     for a in d.get("accepts") or []:
         if not isinstance(a, dict):
@@ -207,7 +221,12 @@ def parse_live_accepts(body: bytes):
                           else a.get("amount") or ""),
             "payTo": a.get("payTo"),
         })
-    return out
+    return out, ver
+
+
+def parse_live_accepts(body: bytes):
+    """後方互換ラッパー: acceptsのみ返す"""
+    return parse_live_402(body)[0]
 
 
 def check_consistency(registry_accepts: list, live_accepts: list):
@@ -281,7 +300,7 @@ def probe_one(conn, row, ts):
     status, body, latency, err = fetch(url)
     alive = status is not None
     is_402 = status == 402
-    live_accepts = parse_live_accepts(body) if is_402 else None
+    live_accepts, live_ver = parse_live_402(body) if is_402 else (None, None)
 
     if not alive:
         consistency = "unreachable"
@@ -299,11 +318,11 @@ def probe_one(conn, row, ts):
 
     conn.execute(
         "INSERT INTO x402_probes(resource_id, probed_at, alive, http_status, is_402,"
-        " latency_ms, live_accepts_json, consistency, fail_count, error)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        " latency_ms, live_accepts_json, consistency, fail_count, error, live_x402_version)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (rid, ts, 1 if alive else 0, status, 1 if is_402 else 0, latency,
          json.dumps(live_accepts, ensure_ascii=False) if live_accepts else None,
-         consistency, fail_count, err))
+         consistency, fail_count, err, live_ver))
 
     # --- 状態遷移イベント(初回観測 or 状態が変わった時だけ) ---
     def emit(etype, sev, det):
@@ -325,6 +344,22 @@ def probe_one(conn, row, ts):
         emit("live_price_mismatch", "high", detail)
     if (consistency == "ok" and prev_cons in ("payto_mismatch", "price_mismatch")):
         emit("consistency_restored", "medium", {"previous": prev_cons})
+    # settle互換性の遷移のみイベント化(初回観測では発火せず、read-time表示に委ねる:
+    # 大半の掲載がV1のためNULL→1で発火させるとフィードが洪水になる)
+    prev_ver = (prev["live_x402_version"]
+                if prev is not None and "live_x402_version" in prev.keys() else None)
+    if is_402 and prev_ver is not None:
+        if prev_ver >= 2 and (live_ver is None or live_ver == 1):
+            emit("settle_compat_risk", "medium", {
+                "before_x402Version": prev_ver, "after_x402Version": live_ver,
+                "note": "Endpoint downgraded to x402Version 1 payment terms. The CDP "
+                        "facilitator moved to a V2-only schema in 2026-07; unpatched V1 "
+                        "integrations fail settle silently. Verify your payment path "
+                        "end-to-end (a 402 that verifies is not proof that settle works)."})
+        if (prev_ver == 1 or prev_ver == 0) and live_ver is not None and live_ver >= 2:
+            emit("settle_compat_ok", "low", {
+                "before_x402Version": prev_ver, "after_x402Version": live_ver,
+                "note": "Endpoint now serves x402Version 2 payment terms."})
     return consistency
 
 
@@ -334,6 +369,7 @@ def run(budget=DEFAULT_BUDGET, conn=None, delay=REQUEST_DELAY_SEC):
         conn = store.connect()
     conn.executescript(x402watch.SCHEMA_SQL)
     conn.executescript(SCHEMA_SQL)
+    _migrate(conn)
     ts = store.now_utc()
     targets = pick_targets(conn, budget)
     summary = {}
