@@ -2133,12 +2133,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 審査済み新着フィード(検証パイプライン企業=実購入セグメント向け) ----
 
-    def _vetted_new_items(self, conn, since, limit):
-        """since以降に初見になったBazaarリソース+最新プローブ+trustを結合"""
+    def _vetted_new_items(self, conn, since, limit, until=None):
+        """since以降(untilまで)に初見になったBazaarリソース+最新プローブ+trustを結合"""
         from . import x402trust
         rows = conn.execute(
-            "SELECT * FROM x402_resources WHERE first_seen>=? AND active=1"
-            " ORDER BY first_seen DESC LIMIT ?", (since, limit)).fetchall()
+            "SELECT * FROM x402_resources WHERE first_seen>=? AND first_seen<=?"
+            " AND active=1 ORDER BY first_seen DESC LIMIT ?",
+            (since, until or "9999", limit)).fetchall()
         items = []
         for r in rows:
             rec = json.loads(r["latest_json"])
@@ -2176,8 +2177,7 @@ class Handler(BaseHTTPRequestHandler):
         now = datetime.datetime.now(datetime.timezone.utc)
         until = (now - datetime.timedelta(hours=24)).isoformat()
         since = (now - datetime.timedelta(hours=48)).isoformat()
-        items = [i for i in self._vetted_new_items(conn, since, 100)
-                 if i["first_seen"] <= until][:3]
+        items = self._vetted_new_items(conn, since, 3, until=until)
         self._json({
             "service": "kkj-watch vetted-new sample (24h-delayed, 3 items)",
             "what_you_get_paid": "every new Bazaar listing since your ?since=, each "
