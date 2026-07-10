@@ -334,7 +334,17 @@ def stats(conn=None):
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "sync"
     if cmd == "sync":
-        print(json.dumps(sync(), ensure_ascii=False, indent=1))
+        out = sync()
+        # 新規掲載を即プローブ(審査済み新着=vetted-newフィードの鮮度を作る)。
+        # プローブ失敗はsync成功に影響させない。
+        if not out.get("seed") and out.get("new"):
+            try:
+                from . import x402probe
+                out["new_probe"] = x402probe.probe_new_listings(
+                    since_ts=out["at"], cap=50)
+            except Exception as e:
+                out["new_probe"] = {"error": str(e)[:200]}
+        print(json.dumps(out, ensure_ascii=False, indent=1))
     elif cmd == "stats":
         print(json.dumps(stats(), ensure_ascii=False, indent=1))
     else:

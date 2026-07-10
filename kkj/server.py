@@ -24,6 +24,8 @@ LLMS_TXT = """# kkj-watch — change detection for machines
 >    SHA-256 snapshot audit trail. Check it BEFORE paying a cached x402 endpoint.
 > 2. JAPANESE PROCUREMENT WATCH — corrections, deadline changes, requirement changes and document
 >    replacements in Japanese government tenders (kkj.go.jp), with before/after, impact tags and quotes.
+> Plus AGENT FUEL — 8 small signed data products ($0.01-0.02): npm downloads, GitHub trending,
+> HN attention, DNS/RDAP lookups, DeFi yields, crypto Fear & Greed. Catalog: GET /fuel
 
 ## x402 Trust Index (free) — an OBSERVED trust score, backed by daily signed hash-chain roots
 
@@ -108,10 +110,32 @@ listing age/stability, and spam-farm detection (one payTo behind dozens of listi
   every registry snapshot (SHA-256 audit trail), every change event, every live-probe result.
 - GET /paid/x402/history/{id} : $0.01 — snapshot + change-event history only.
 - GET /paid/x402/reverify/{id} : $0.25 — operator instant re-verification (see above).
+- GET /paid/x402/vetted-new?since=ISO8601 : $0.10 — VETTED NEW-LISTINGS FEED for verification
+  pipelines: every Bazaar resource first seen since ?since= (default 24h), live-probed within
+  minutes of first sighting. Per item: alive, real-402, registered-vs-live price/payTo
+  consistency, x402Version (V1 = settle-compat risk after the CDP V2 migration), trust score.
+  Skip probing 26k endpoints yourself. The 402 body tells you how many items your ?since=
+  would return BEFORE you pay. Free 24h-delayed sample: GET /x402/vetted-new/sample
 
 Why this exists: the x402 protocol re-fetches payment terms at 402 time, so it happily pays a
 hijacked payTo or a silently-10x'd price. Only history + independent live verification catches that.
 Probes are GET-only, never pay, never follow redirects, and only target Bazaar-listed resources.
+
+## Agent Fuel — small signed data products ($0.01-0.02, x402 USDC on Base)
+
+Cheap, fresh, machine-parseable data an agent needs mid-task. Every response includes signed
+provenance: upstream URLs + fetched_at + sha256 of the data + Ed25519 signature (identity:
+/.well-known/witness). Upstreams are a fixed whitelist of public no-auth APIs; we sell the
+aggregation, normalization, caching and the signature. Full catalog (free): GET /fuel
+
+- GET /paid/fuel/npm/downloads/{package} : $0.01 — weekly+monthly downloads, 14-day series, momentum
+- GET /paid/fuel/github/trending?language= : $0.02 — repos created last 7 days ranked by stars (top 25)
+- GET /paid/fuel/hn/frontpage : $0.01 — HN front page now, points/comments + attention totals
+- GET /paid/fuel/hn/buzz/{keyword} : $0.02 — 7-day HN attention metrics for any keyword
+- GET /paid/fuel/dns/{hostname} : $0.01 — A/AAAA/MX/TXT/NS with TTLs via DoH, normalized
+- GET /paid/fuel/rdap/{domain} : $0.02 — registration data: registrar, created/expiry, status, NS
+- GET /paid/fuel/defi/yields?project=&chain=&stablecoin=1 : $0.02 — top-TVL pool APYs (DefiLlama)
+- GET /paid/fuel/crypto/fear-greed : $0.01 — Fear & Greed index now + 30-day series
 
 ## MCP Trust Directory — tool-definition drift detection for MCP servers
 
@@ -930,6 +954,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._sitemap_mcp(conn)
             elif path.startswith("/paid/mcp/report/"):
                 self._paid_mcp_report(conn, path)
+            elif path == "/fuel":
+                self._fuel_catalog(conn)
+            elif path.startswith("/paid/fuel/"):
+                self._paid_fuel(conn, path, qs)
+            elif path == "/x402/vetted-new/sample":
+                self._x402_vetted_sample(conn)
+            elif path == "/paid/x402/vetted-new":
+                self._paid_x402_vetted_new(conn, qs)
             elif path in ("/jp/directory.json", "/jp/directory.ndjson"):
                 self._jp_directory(conn, "ndjson" if path.endswith(".ndjson") else "json")
             elif path.startswith("/jp/e/"):
@@ -1993,6 +2025,232 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---- エージェント燃料データ棚(fuel: 実需要=dataカテゴリ$0.01-0.05帯に合わせた商品群) ----
+
+    def _fuel_catalog(self, conn):
+        """無料: 燃料データ商品カタログ(発見面。402の前に何が買えるかを見せる)"""
+        from . import fuel
+        base = self._base_url()
+        products = {}
+        for key, meta in fuel.CATALOG.items():
+            products[key] = {
+                "endpoint": f"{base}/paid/fuel/{key}"
+                            + (f"/{{{meta['param']}}}" if meta["param"] else ""),
+                "example": f"{base}{meta['example']}",
+                "price_usd": meta["price_usd"],
+                "summary": meta["summary"],
+                "cache_ttl_sec": meta["cache_ttl_sec"],
+            }
+        self._json({
+            "service": "kkj-watch Agent Fuel — small, signed data products for agents",
+            "how_to_pay": "x402: GET the endpoint, receive 402 with payment requirements, "
+                          "pay USDC on Base via any x402 client, retry with X-PAYMENT.",
+            "provenance": "every response includes upstream URLs, fetched_at, sha256 of "
+                          "the data field and an Ed25519 signature "
+                          f"(identity: {base}/.well-known/witness)",
+            "upstream_policy": "fixed whitelist of public no-auth APIs; derived/aggregated "
+                               "metrics; verify against upstream anytime",
+            "products": products,
+        })
+
+    def _paid_fuel(self, conn, path, qs):
+        """有料($0.01-0.02): 燃料データ商品。検証→(402)→上流フェッチ→settle→返却。
+        上流フェッチは支払い試行時のみ(unpaid 402で上流クォータを消費しない)。"""
+        from . import x402_gate, fuel, paid
+        base = self._base_url()
+        if not x402_gate.available():
+            self._json({"error": "payments_not_configured"}, 503)
+            return
+        rest = path[len("/paid/fuel/"):]
+        product, arg = None, None
+        for key in sorted(fuel.CATALOG, key=len, reverse=True):   # 最長一致
+            if rest == key:
+                product, arg = key, None
+                break
+            if rest.startswith(key + "/"):
+                product = key
+                arg = urllib.parse.unquote(rest[len(key) + 1:])
+                break
+        if product is None:
+            self._json({"error": "unknown_product",
+                        "catalog": f"{base}/fuel"}, 404)
+            return
+        try:
+            fuel.validate(product, arg)      # 支払い要求の前に入力を検証
+        except fuel.FuelError as e:
+            self._json({"error": "invalid_input", "detail": str(e),
+                        "catalog": f"{base}/fuel"}, 400)
+            return
+        meta = fuel.CATALOG[product]
+        resource = f"{base}{path}"
+        reqs = x402_gate.payment_requirements(
+            resource,
+            meta["summary"] + " Signed provenance (upstream URLs + sha256 + Ed25519) "
+            f"included. Catalog of all fuel products (free): {base}/fuel",
+            output_schema={"input": {"type": "http", "method": "GET"}},
+            price_usd=meta["price_usd"],
+        )
+        x_payment = self.headers.get("X-Payment") or self.headers.get("X-PAYMENT", "")
+        if not x_payment:                    # 未払い: 上流を呼ばず402だけ返す
+            self._json(x402_gate.body_402(reqs, free={"catalog": f"{base}/fuel"}), 402)
+            return
+        # 支払い試行あり: 先にデータを確保してからsettle(取れなければ課金しない)
+        try:
+            data, prov, cache_hit = fuel.get_product(conn, product, arg, qs)
+        except fuel.FuelError as e:
+            self._json({"error": "invalid_input", "detail": str(e),
+                        "note": "payment NOT settled"}, 400)
+            return
+        except fuel.UpstreamError as e:
+            self._json({"error": "upstream_unavailable", "detail": str(e)[:200],
+                        "note": "payment NOT settled; retry later"}, 503)
+            return
+        qkey = json.dumps({k: qs[k] for k in sorted(qs)
+                           if k in ("language", "project", "chain", "stablecoin")},
+                          sort_keys=True)
+        job = self._settle_and_claim(conn, reqs, resource,
+                                     f"fuel:{product}:{arg or ''}:{qkey}",
+                                     free_hint={"catalog": f"{base}/fuel"})
+        if job is None:
+            return
+        if job["status"] == "succeeded" and job["result_json"]:
+            self._json({"cached": True, **json.loads(job["result_json"]),
+                        "retry_token": job["retry_token"]})
+            return
+        payload = {"product": product, "data": data, "provenance": prov}
+        paid.finish(conn, job["retry_token"], "succeeded", payload)
+        fuel.log_sale(conn, product, resource, cache_hit)
+        body = json.dumps({"cached": False, **payload,
+                           "retry_token": job["retry_token"]},
+                          ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if job["settlement"]:
+            self.send_header("X-PAYMENT-RESPONSE", job["settlement"])
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ---- 審査済み新着フィード(検証パイプライン企業=実購入セグメント向け) ----
+
+    def _vetted_new_items(self, conn, since, limit):
+        """since以降に初見になったBazaarリソース+最新プローブ+trustを結合"""
+        from . import x402trust
+        rows = conn.execute(
+            "SELECT * FROM x402_resources WHERE first_seen>=? AND active=1"
+            " ORDER BY first_seen DESC LIMIT ?", (since, limit)).fetchall()
+        items = []
+        for r in rows:
+            rec = json.loads(r["latest_json"])
+            acc = (rec.get("accepts") or [{}])[0]
+            p = conn.execute(
+                "SELECT * FROM x402_probes WHERE resource_id=? ORDER BY id DESC LIMIT 1",
+                (r["id"],)).fetchone()
+            probe = None
+            if p is not None:
+                probe = {"probed_at": p["probed_at"], "alive": bool(p["alive"]),
+                         "http_status": p["http_status"], "is_402": bool(p["is_402"]),
+                         "consistency": p["consistency"],
+                         "latency_ms": p["latency_ms"],
+                         "live_x402_version": (p["live_x402_version"]
+                                               if "live_x402_version" in p.keys() else None)}
+            items.append({
+                "resource": r["resource"], "service_name": r["service_name"],
+                "first_seen": r["first_seen"],
+                "registered": {"network": acc.get("network"),
+                               "amount": acc.get("amount") or acc.get("maxAmountRequired"),
+                               "payTo": acc.get("payTo"),
+                               "price_usd": x402trust.price_usd_min(rec)},
+                "description": (rec.get("description") or "")[:200],
+                "probe": probe,
+                "observed_trust_score": r["trust_score"],
+            })
+        return items
+
+    def _x402_vetted_sample(self, conn):
+        """無料: 24時間遅延サンプル(フォーマット評価用。鮮度が商品なので遅延させる)"""
+        from . import x402watch
+        conn.executescript(x402watch.SCHEMA_SQL)
+        import datetime
+        base = self._base_url()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        until = (now - datetime.timedelta(hours=24)).isoformat()
+        since = (now - datetime.timedelta(hours=48)).isoformat()
+        items = [i for i in self._vetted_new_items(conn, since, 100)
+                 if i["first_seen"] <= until][:3]
+        self._json({
+            "service": "kkj-watch vetted-new sample (24h-delayed, 3 items)",
+            "what_you_get_paid": "every new Bazaar listing since your ?since=, each "
+                                 "live-probed within minutes of first sighting: alive, "
+                                 "real 402, registered-vs-live price/payTo consistency, "
+                                 "x402Version (V1 = settle-compat risk), trust score.",
+            "paid_endpoint": f"{base}/paid/x402/vetted-new?since=ISO8601 ($0.10)",
+            "sample_items": items,
+        })
+
+    def _paid_x402_vetted_new(self, conn, qs):
+        """有料($0.10): 審査済み新着バルクフィード。検証パイプラインの下見コスト肩代わり。
+        402のfree_hintに在庫数を出す=買う前に空振りが分かる(paid-but-empty防止)。"""
+        from . import x402_gate, x402watch, paid
+        conn.executescript(x402watch.SCHEMA_SQL)
+        base = self._base_url()
+        if not x402_gate.available():
+            self._json({"error": "payments_not_configured"}, 503)
+            return
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        since = (qs.get("since") or [""])[0] or (
+            now - datetime.timedelta(hours=24)).isoformat()
+        try:
+            datetime.datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError:
+            self._json({"error": "invalid_since", "hint": "ISO8601, e.g. "
+                        f"{(now - datetime.timedelta(hours=24)).isoformat()}"}, 400)
+            return
+        try:
+            limit = min(int((qs.get("limit") or ["500"])[0]), 500)
+        except ValueError:
+            limit = 500
+        count = conn.execute(
+            "SELECT COUNT(*) n FROM x402_resources WHERE first_seen>=? AND active=1",
+            (since,)).fetchone()["n"]
+        resource = f"{base}/paid/x402/vetted-new"
+        reqs = x402_gate.payment_requirements(
+            resource,
+            "Vetted new-listings feed: every x402 Bazaar resource first seen since "
+            "?since= (default 24h), live-probed within minutes of first sighting. "
+            "Per item: alive, real-402, registered-vs-live price/payTo consistency, "
+            "x402Version (V1 = settle likely broken after the CDP V2 migration), "
+            "observed trust score. Built for endpoint-verification pipelines: skip "
+            f"probing 26k endpoints yourself. Free delayed sample: {base}/x402/vetted-new/sample",
+            output_schema={"input": {"type": "http", "method": "GET"}},
+            price_usd=0.10,
+        )
+        free_hint = {"sample": f"{base}/x402/vetted-new/sample",
+                     "items_available_for_your_since": count}
+        job = self._settle_and_claim(conn, reqs, resource,
+                                     f"vetted:{since}:{limit}", free_hint=free_hint)
+        if job is None:
+            return
+        if job["status"] == "succeeded" and job["result_json"]:
+            self._json({"cached": True, **json.loads(job["result_json"]),
+                        "retry_token": job["retry_token"]})
+            return
+        items = self._vetted_new_items(conn, since, limit)
+        payload = {"since": since, "count": len(items), "items": items,
+                   "disclaimer": "Observed, evidence-based record. Not a safety guarantee."}
+        paid.finish(conn, job["retry_token"], "succeeded", payload)
+        body = json.dumps({"cached": False, **payload,
+                           "retry_token": job["retry_token"]},
+                          ensure_ascii=False, indent=1).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if job["settlement"]:
+            self.send_header("X-PAYMENT-RESPONSE", job["settlement"])
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # ---- verifiedバッジ(#3: 売り手に自分でTrustを宣伝してもらう) ----
 
     _GRADE_COLOR = {"A": "#4c1", "B": "#97ca00", "C": "#dfb317",
@@ -2789,6 +3047,33 @@ class Handler(BaseHTTPRequestHandler):
                     "Operator instant re-verification: immediate probe + score recompute, "
                     "$0.25 via x402 (score itself cannot be bought)", paid=True),
                 "/x402/attestations": op("Latest signed daily hash-chain root (free)"),
+                "/fuel": op("Agent Fuel catalog: 8 small signed data products (free index)"),
+                "/paid/fuel/npm/downloads/{package}": op(
+                    "npm downloads: week+month totals, 14-day series, momentum, "
+                    "$0.01 via x402", paid=True),
+                "/paid/fuel/github/trending": op(
+                    "GitHub trending: repos created last 7d ranked by stars, $0.02 via x402",
+                    ["language"], paid=True),
+                "/paid/fuel/hn/frontpage": op(
+                    "Hacker News front page with attention totals, $0.01 via x402", paid=True),
+                "/paid/fuel/hn/buzz/{keyword}": op(
+                    "7-day HN attention metrics for a keyword, $0.02 via x402", paid=True),
+                "/paid/fuel/dns/{hostname}": op(
+                    "DNS A/AAAA/MX/TXT/NS via DoH, normalized, $0.01 via x402", paid=True),
+                "/paid/fuel/rdap/{domain}": op(
+                    "Domain registration data (RDAP): registrar/created/expiry/status, "
+                    "$0.02 via x402", paid=True),
+                "/paid/fuel/defi/yields": op(
+                    "DeFi yields from top-500-TVL pools (DefiLlama), $0.02 via x402",
+                    ["project", "chain", "stablecoin"], paid=True),
+                "/paid/fuel/crypto/fear-greed": op(
+                    "Crypto Fear & Greed index + 30d series, $0.01 via x402", paid=True),
+                "/x402/vetted-new/sample": op(
+                    "24h-delayed sample of the vetted new-listings feed (free)"),
+                "/paid/x402/vetted-new": op(
+                    "Vetted new-listings feed: new Bazaar resources since ?since=, "
+                    "live-probed within minutes (alive/402/consistency/x402Version/trust), "
+                    "$0.10 via x402", ["since", "limit"], paid=True),
             },
         })
 
@@ -2925,16 +3210,52 @@ class Handler(BaseHTTPRequestHandler):
                 "accepts": [reverify_reqs],
                 "lastUpdated": store.now_utc(),
             })
+            vetted_reqs = x402_gate.payment_requirements(
+                f"{base}/paid/x402/vetted-new",
+                "Vetted new-listings feed: every new x402 Bazaar resource since ?since= "
+                "(default 24h), live-probed within minutes of first sighting - alive, "
+                "real-402, registered-vs-live price/payTo consistency, x402Version "
+                "(V1 = settle-compat risk), observed trust score. For endpoint-"
+                f"verification pipelines. Free 24h-delayed sample: {base}/x402/vetted-new/sample",
+                output_schema={"input": {"type": "http", "method": "GET"}},
+                price_usd=0.10,
+            )
+            resources.append({
+                "resource": f"{base}/paid/x402/vetted-new",
+                "type": "http", "method": "GET",
+                "x402Version": 1,
+                "accepts": [vetted_reqs],
+                "lastUpdated": store.now_utc(),
+            })
+            from . import fuel as _fuel
+            for _key, _meta in _fuel.CATALOG.items():
+                _example_path = _meta["example"].split("?")[0]
+                _freqs = x402_gate.payment_requirements(
+                    f"{base}{_example_path}",
+                    _meta["summary"] + " Signed provenance (upstream sha256 + Ed25519) "
+                    f"included. All fuel products (free catalog): {base}/fuel",
+                    output_schema={"input": {"type": "http", "method": "GET"}},
+                    price_usd=_meta["price_usd"],
+                )
+                resources.append({
+                    "resource": f"{base}{_example_path}",
+                    "type": "http", "method": "GET",
+                    "x402Version": 1,
+                    "accepts": [_freqs],
+                    "lastUpdated": store.now_utc(),
+                })
         self._json({
             "x402Version": 1,
             "name": "kkj-watch",
             "description": "Change-detection for machines: (1) Japanese government tender "
                            "(kkj.go.jp) changes + structured bidding requirements; "
                            "(2) x402 Bazaar registry changes (price/payTo/schema/listing) "
-                           "with audit trail. Machine-payable via x402.",
+                           "with audit trail; (3) Agent Fuel: small signed data products "
+                           "(npm/GitHub/HN/DNS/RDAP/DeFi yields/Fear&Greed). "
+                           "Machine-payable via x402.",
             "docs": f"{base}/llms.txt",
             "mcp": f"{base}/mcp",
-            "free_feeds": [f"{base}/events", f"{base}/x402/changes"],
+            "free_feeds": [f"{base}/events", f"{base}/x402/changes", f"{base}/fuel"],
             "resources": resources,
         })
 

@@ -403,6 +403,47 @@ def run(budget=DEFAULT_BUDGET, conn=None, delay=REQUEST_DELAY_SEC):
     return out
 
 
+def probe_new_listings(conn=None, since_ts=None, cap=50):
+    """新規掲載の即時プローブ(vetted-newフィードの鮮度の核)。
+
+    x402watch.sync直後に呼び、そのsyncで初見になったリソースを
+    即座に検証する(生存・実402・payTo/価格一致・x402Version)。
+    通常の30分周期(全2.6万件で~29h)を待たずに審査済み在庫化する。"""
+    own = conn is None
+    if own:
+        conn = store.connect()
+    conn.executescript(x402watch.SCHEMA_SQL)
+    conn.executescript(SCHEMA_SQL)
+    _migrate(conn)
+    ts = store.now_utc()
+    rows = conn.execute(
+        "SELECT * FROM x402_resources WHERE active=1 AND first_seen>=?"
+        " ORDER BY id DESC LIMIT ?", (since_ts or ts[:10], cap)).fetchall()
+    summary = {}
+    for row in rows:
+        try:
+            c = probe_one(conn, row, ts)
+        except Exception as e:
+            c = "error"
+            conn.execute(
+                "INSERT INTO x402_probes(resource_id, probed_at, alive, http_status, is_402,"
+                " latency_ms, live_accepts_json, consistency, fail_count, error)"
+                " VALUES (?,?,0,NULL,0,NULL,NULL,'error',0,?)",
+                (row["id"], ts, str(e)[:200]))
+        summary[c] = summary.get(c, 0) + 1
+        try:
+            from . import x402trust
+            x402trust.update_score(conn, row["id"])
+        except Exception:
+            pass
+        conn.commit()                     # 毎件commit(ロック持ち越し防止)
+        time.sleep(REQUEST_DELAY_SEC)
+    out = {"at": ts, "new_probed": len(rows), "by_consistency": summary}
+    if own:
+        conn.close()
+    return out
+
+
 def stats(conn=None):
     own = conn is None
     if own:
