@@ -107,7 +107,8 @@ listing age/stability, and spam-farm detection (one payTo behind dozens of listi
 ## x402 Trust Index (paid, x402 USDC on Base)
 
 - GET /paid/x402/report/{id} : $0.02 — the full due-diligence dossier: trust score with evidence,
-  every registry snapshot (SHA-256 audit trail), every change event, every live-probe result.
+  every registry snapshot (SHA-256 audit trail), every change event, recent live-probe history
+  (rolling window, most recent ~100 probes/resource).
 - GET /paid/x402/history/{id} : $0.01 — snapshot + change-event history only.
 - GET /paid/x402/reverify/{id} : $0.25 — operator instant re-verification (see above).
 - GET /paid/x402/vetted-new?since=ISO8601 : $0.10 — VETTED NEW-LISTINGS FEED for verification
@@ -1597,8 +1598,9 @@ class Handler(BaseHTTPRequestHandler):
             resource,
             "x402 Trust Index dossier for one Bazaar resource: trust score with full scoring "
             "evidence, every registry snapshot (SHA-256 audit trail), every change event "
-            "(price/payTo/schema/listing) and every live-probe result. The complete due-"
-            f"diligence bundle before paying an endpoint. Free preview: {base}/x402/trust/{{id}}",
+            "(price/payTo/schema/listing) and recent live-probe history (rolling window, "
+            f"most recent ~100 probes/resource). The complete due-diligence bundle before "
+            f"paying an endpoint. Free preview: {base}/x402/trust/{{id}}",
             output_schema={"input": {"type": "http", "method": "GET"}},
             price_usd=0.02,
         )
@@ -3164,7 +3166,8 @@ class Handler(BaseHTTPRequestHandler):
                 f"{base}/paid/x402/report/1",
                 "x402 Trust Index dossier: trust score (liveness, listing-vs-live consistency, "
                 "payTo stability, spam-farm detection) with full evidence — every registry "
-                "snapshot, change event and live-probe result for one Bazaar resource. "
+                "snapshot, change event, and recent live-probe history (rolling window, most "
+                "recent ~100 probes/resource) for one Bazaar resource. "
                 f"Free preview: {base}/x402/trust/{{id}} and {base}/x402/leaderboard",
                 output_schema={"input": {"type": "http", "method": "GET"}},
                 price_usd=0.02,

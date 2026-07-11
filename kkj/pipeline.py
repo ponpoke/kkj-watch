@@ -5,6 +5,7 @@
   python -m kkj.pipeline extract [N]     # 未抽出の案件N件を構造化(要ANTHROPIC_API_KEY)
   python -m kkj.pipeline stats           # 蓄積状況
   python -m kkj.pipeline events [N]      # 直近イベント
+  python -m kkj.pipeline prune [usage_days] [probes_keep]  # 容量対策(既定90日/100件)
 """
 import json
 import sys
@@ -88,6 +89,36 @@ def cmd_backup(keep=14):
     print(f"backup: {dest.name} (保持 {min(keep, len(list(backups.glob('kkj_*.db'))))}世代)")
 
 
+def cmd_prune(usage_days=90, probes_keep=100):
+    """容量対策: usage_log(usage_days超の行)とx402_probes(resource毎に直近
+    probes_keep件を超える古い行)を削除し、実際に減った時だけVACUUMでディスクを回収する。
+    usage_logはbotノイズ主体のアクセスログで商品ではないため全削除して問題ない。
+    x402_probesは唯一「29h周期で回り続け、資源数に関係なく無期限に増え続ける」テーブル
+    (トラスト調書が'every live-probe result'ではなく直近履歴と明記しているのはこのため)。
+    x402_snapshots/x402_eventsは有料商品(履歴フィード)の実データなので対象外。"""
+    from datetime import datetime, timedelta, timezone
+    conn = store.connect()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=usage_days)).isoformat()
+    usage_deleted = conn.execute(
+        "DELETE FROM usage_log WHERE at < ?", (cutoff,)).rowcount
+    probes_deleted = conn.execute(
+        """DELETE FROM x402_probes WHERE id IN (
+               SELECT id FROM (
+                   SELECT id, ROW_NUMBER() OVER (
+                       PARTITION BY resource_id ORDER BY id DESC) AS rn
+                   FROM x402_probes)
+               WHERE rn > ?)""", (probes_keep,)).rowcount
+    conn.commit()
+    print(f"pruned: usage_log -{usage_deleted} (>{usage_days}d), "
+          f"x402_probes -{probes_deleted} (keep {probes_keep}/resource)")
+    if usage_deleted or probes_deleted:
+        conn.execute("VACUUM")
+        print("vacuum: done")
+    else:
+        print("vacuum: skipped (nothing pruned)")
+    conn.close()
+
+
 def cmd_stats():
     conn = store.connect()
     for table in ("cases", "snapshots", "events", "documents", "extractions"):
@@ -139,6 +170,9 @@ def main():
         watch.digest()
     elif cmd == "backup":
         cmd_backup(int(args[1]) if len(args) > 1 else 14)
+    elif cmd == "prune":
+        cmd_prune(int(args[1]) if len(args) > 1 else 90,
+                  int(args[2]) if len(args) > 2 else 100)
     elif cmd == "link":
         from . import linker
         linker.link_corrections(int(args[1]) if len(args) > 1 else 30)
