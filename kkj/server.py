@@ -3141,8 +3141,8 @@ class Handler(BaseHTTPRequestHandler):
             resources.append({
                 "resource": f"{base}/paid/requirements/latest",
                 "type": "http", "method": "GET",
-                "x402Version": 1,
-                "accepts": [reqs],
+                "x402Version": 2,
+                "accepts": [x402_gate.v2_requirements(reqs)],
                 "lastUpdated": store.now_utc(),
             })
             hist_reqs = x402_gate.payment_requirements(
@@ -3156,8 +3156,8 @@ class Handler(BaseHTTPRequestHandler):
             resources.append({
                 "resource": f"{base}/paid/x402/history/1",
                 "type": "http", "method": "GET",
-                "x402Version": 1,
-                "accepts": [hist_reqs],
+                "x402Version": 2,
+                "accepts": [x402_gate.v2_requirements(hist_reqs)],
                 "lastUpdated": store.now_utc(),
             })
             report_reqs = x402_gate.payment_requirements(
@@ -3172,8 +3172,8 @@ class Handler(BaseHTTPRequestHandler):
             resources.append({
                 "resource": f"{base}/paid/x402/report/1",
                 "type": "http", "method": "GET",
-                "x402Version": 1,
-                "accepts": [report_reqs],
+                "x402Version": 2,
+                "accepts": [x402_gate.v2_requirements(report_reqs)],
                 "lastUpdated": store.now_utc(),
             })
             attest_reqs = x402_gate.payment_requirements(
@@ -3188,8 +3188,8 @@ class Handler(BaseHTTPRequestHandler):
             resources.append({
                 "resource": f"{base}/paid/x402/attest/1",
                 "type": "http", "method": "GET",
-                "x402Version": 1,
-                "accepts": [attest_reqs],
+                "x402Version": 2,
+                "accepts": [x402_gate.v2_requirements(attest_reqs)],
                 "lastUpdated": store.now_utc(),
             })
             reverify_reqs = x402_gate.payment_requirements(
@@ -3206,8 +3206,8 @@ class Handler(BaseHTTPRequestHandler):
             resources.append({
                 "resource": f"{base}/paid/x402/reverify/1",
                 "type": "http", "method": "GET",
-                "x402Version": 1,
-                "accepts": [reverify_reqs],
+                "x402Version": 2,
+                "accepts": [x402_gate.v2_requirements(reverify_reqs)],
                 "lastUpdated": store.now_utc(),
             })
             vetted_reqs = x402_gate.payment_requirements(
@@ -3223,8 +3223,8 @@ class Handler(BaseHTTPRequestHandler):
             resources.append({
                 "resource": f"{base}/paid/x402/vetted-new",
                 "type": "http", "method": "GET",
-                "x402Version": 1,
-                "accepts": [vetted_reqs],
+                "x402Version": 2,
+                "accepts": [x402_gate.v2_requirements(vetted_reqs)],
                 "lastUpdated": store.now_utc(),
             })
             from . import fuel as _fuel
@@ -3240,12 +3240,12 @@ class Handler(BaseHTTPRequestHandler):
                 resources.append({
                     "resource": f"{base}{_example_path}",
                     "type": "http", "method": "GET",
-                    "x402Version": 1,
-                    "accepts": [_freqs],
+                    "x402Version": 2,
+                    "accepts": [x402_gate.v2_requirements(_freqs)],
                     "lastUpdated": store.now_utc(),
                 })
         self._json({
-            "x402Version": 1,
+            "x402Version": 2,
             "name": "kkj-watch",
             "description": "Change-detection for machines: (1) Japanese government tender "
                            "(kkj.go.jp) changes + structured bidding requirements; "

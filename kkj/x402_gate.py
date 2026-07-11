@@ -32,8 +32,10 @@ FACILITATOR = {
 }
 
 # CDPファシリテータは2026-07からCAIP-2形式のネットワークIDのみ受理
-# (旧表記"base"はスキーマ400で拒否される。402応答では互換性のため旧表記を維持し、
-#  ファシリテータとの通信時のみ正規化する)
+# (旧表記"base"はスキーマ400で拒否される)。Bazaar discoveryのインデックスも
+# 同時期にx402Version 2/CAIP-2主体に移行しており(実測: 新規掲載の98.6%がV2)、
+# V1表記のままの402応答は新規リソースとして掲載されない(既存の実測結果)。
+# → 402応答・ファシリテータ通信の両方でV2/CAIP-2に正規化する。
 CAIP2_NETWORK = {"base": "eip155:8453", "base-sepolia": "eip155:84532"}
 
 
@@ -41,10 +43,10 @@ def _caip2(net):
     return CAIP2_NETWORK.get(net or "", net or "")
 
 
-def _v2_requirements(req: dict) -> dict:
-    """CDPの新スキーマ(x402V2PaymentRequirements)向け正規化:
-    network=CAIP-2 + 'amount'必須(V1のmaxAmountRequiredと同値)。
-    402応答は互換性のためV1表記のまま、ファシリテータ送信時のみ変換する。"""
+def v2_requirements(req: dict) -> dict:
+    """x402V2PaymentRequirements向け正規化: network=CAIP-2 + 'amount'必須
+    (V1のmaxAmountRequiredと同値、両方保持してV1専用クライアントとの互換性も維持)。
+    402応答・ファシリテータ通信の両方で使う。"""
     out = {**req, "network": _caip2(req.get("network"))}
     if "amount" not in out and out.get("maxAmountRequired"):
         out["amount"] = out["maxAmountRequired"]
@@ -57,7 +59,7 @@ def _v2_envelope(payment: dict, requirements: dict) -> dict:
     V1エンベロープは内側ルーティング(invalid_network)で拒否。
     V2 = CAIP-2 + requirements側'amount' + payload側'accepted'(選択条件のエコー)。
     EIP-3009署名はネットワーク文字列を含まないため変換は署名検証に影響しない。"""
-    reqs2 = _v2_requirements(requirements)
+    reqs2 = v2_requirements(requirements)
     pay2 = {
         "x402Version": 2,
         "scheme": payment.get("scheme", "exact"),
@@ -102,7 +104,7 @@ def payment_requirements(resource_url: str, description: str, output_schema=None
 
 
 def body_402(requirements: dict, error="X-PAYMENT header is required", free=None) -> dict:
-    body = {"x402Version": 1, "error": error, "accepts": [requirements]}
+    body = {"x402Version": 2, "error": error, "accepts": [v2_requirements(requirements)]}
     if free:
         body["free_alternatives"] = free   # 購入前に無料で価値を確認できる導線(要件3)
     return body
