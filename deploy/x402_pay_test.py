@@ -18,12 +18,25 @@ import urllib.error
 CHAIN_ID = {"base": 8453, "base-sepolia": 84532}
 
 
+def chain_id(network: str) -> int:
+    """V1名("base")とCAIP-2("eip155:8453")の両表記を受ける
+    (V2移行後の402応答はCAIP-2を返す)"""
+    if network.startswith("eip155:"):
+        return int(network.split(":", 1)[1])
+    return CHAIN_ID[network]
+
+
 def load_env():
-    for line in open("/etc/kkj-watch.env"):
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k, v)
+    try:
+        f = open("/etc/kkj-watch.env")
+    except OSError:
+        return   # 非rootではsystemd-run等のEnvironmentFile注入を前提にする
+    with f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k, v)
 
 
 async def cdp_sign_typed_data(domain, types, primary_type, message):
@@ -73,7 +86,7 @@ def main():
     domain = {
         "name": req.get("extra", {}).get("name", "USDC"),
         "version": req.get("extra", {}).get("version", "2"),
-        "chainId": CHAIN_ID[req["network"]],
+        "chainId": chain_id(req["network"]),
         "verifyingContract": req["asset"],
     }
     types = {
