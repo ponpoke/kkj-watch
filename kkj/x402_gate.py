@@ -58,7 +58,11 @@ def _v2_envelope(payment: dict, requirements: dict) -> dict:
     実測: V1形式(network='base')は外側スキーマで拒否、CAIP-2化だけの
     V1エンベロープは内側ルーティング(invalid_network)で拒否。
     V2 = CAIP-2 + requirements側'amount' + payload側'accepted'(選択条件のエコー)。
-    EIP-3009署名はネットワーク文字列を含まないため変換は署名検証に影響しない。"""
+    EIP-3009署名はネットワーク文字列を含まないため変換は署名検証に影響しない。
+    paymentPayload.resourceはBazaar掲載の必須条件(CDPはsettle成功時にこのURLで
+    カタログ登録する。無いと決済は成功しても掲載されない — docs/実測で確認)。
+    V2仕様のResourceInfoはオブジェクト{url,description,mimeType}であり、
+    文字列を入れるとスキーマ400で拒否される(実測)。"""
     reqs2 = v2_requirements(requirements)
     pay2 = {
         "x402Version": 2,
@@ -67,6 +71,12 @@ def _v2_envelope(payment: dict, requirements: dict) -> dict:
         "payload": payment.get("payload"),
         "accepted": reqs2,
     }
+    if reqs2.get("resource"):
+        pay2["resource"] = {
+            "url": reqs2["resource"],
+            "description": reqs2.get("description", ""),
+            "mimeType": reqs2.get("mimeType", "application/json"),
+        }
     return {"x402Version": 2, "paymentPayload": pay2, "paymentRequirements": reqs2}
 
 
