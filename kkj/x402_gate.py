@@ -44,39 +44,58 @@ def _caip2(net):
 
 
 def v2_requirements(req: dict) -> dict:
-    """x402V2PaymentRequirements向け正規化: network=CAIP-2 + 'amount'必須
-    (V1のmaxAmountRequiredと同値、両方保持してV1専用クライアントとの互換性も維持)。
-    402応答・ファシリテータ通信の両方で使う。"""
-    out = {**req, "network": _caip2(req.get("network"))}
-    if "amount" not in out and out.get("maxAmountRequired"):
-        out["amount"] = out["maxAmountRequired"]
-    return out
+    """x402V2PaymentRequirements(exact scheme)の正規形。公式TS型定義
+    ({scheme,network,asset,amount,payTo,maxTimeoutSeconds,extra}のみ)に厳密準拠。
+    旧実装はresource/description/mimeType/outputSchemaというV1由来のフィールドを
+    ここに混入させていたが、これらはPaymentRequirementsの一部ではなく
+    (実物のTS型定義で確認)、外部クライアントの一部でpaymentPayload全体が
+    oneOf不一致([x402V2PaymentPayload,x402V1PaymentPayload]どちらにも
+    マッチしない)スキーマ検証エラーになる一因だった可能性がある。"""
+    return {
+        "scheme": req.get("scheme", "exact"),
+        "network": _caip2(req.get("network")),
+        "asset": req["asset"],
+        "amount": str(req.get("amount") or req.get("maxAmountRequired")),
+        "payTo": req["payTo"],
+        "maxTimeoutSeconds": req.get("maxTimeoutSeconds", 120),
+        "extra": req.get("extra", {}),
+    }
+
+
+def _resource_info(requirements: dict) -> dict | None:
+    """x402 V2 ResourceInfo({url,description,mimeType,...})。PaymentPayload/
+    PaymentRequiredのresourceフィールドはこの形のオブジェクトであり、
+    文字列を入れるとスキーマ400で拒否される(実測)。"""
+    if not requirements.get("resource"):
+        return None
+    return {
+        "url": requirements["resource"],
+        "description": requirements.get("description", ""),
+        "mimeType": requirements.get("mimeType", "application/json"),
+    }
 
 
 def _v2_envelope(payment: dict, requirements: dict) -> dict:
-    """CDPファシリテータ(2026-07以降)が受理するx402 V2エンベロープを組む。
-    実測: V1形式(network='base')は外側スキーマで拒否、CAIP-2化だけの
-    V1エンベロープは内側ルーティング(invalid_network)で拒否。
-    V2 = CAIP-2 + requirements側'amount' + payload側'accepted'(選択条件のエコー)。
-    EIP-3009署名はネットワーク文字列を含まないため変換は署名検証に影響しない。
-    paymentPayload.resourceはBazaar掲載の必須条件(CDPはsettle成功時にこのURLで
-    カタログ登録する。無いと決済は成功しても掲載されない — docs/実測で確認)。
-    V2仕様のResourceInfoはオブジェクト{url,description,mimeType}であり、
-    文字列を入れるとスキーマ400で拒否される(実測)。"""
+    """CDPファシリテータ向けx402 V2エンベロープ。公式TS型定義に厳密準拠:
+    PaymentPayload = {x402Version, resource?, accepted, payload, extensions?}
+    (トップレベルにscheme/networkは存在しない — accepted内のscheme/networkが
+    その役割を持つ)。旧実装はpaymentPayloadに存在しないscheme/networkを
+    トップレベルに追加していた(自己決済では黙って許容されていたが、実際の
+    外部クライアントの一部が送るpaymentPayloadとの往復整合性を崩す一因)。
+    paymentPayload.resourceはBazaar掲載の必須条件(CDPはsettle成功時にこの
+    URLでカタログ登録する)。"""
     reqs2 = v2_requirements(requirements)
+    inner_payload = payment.get("payload")
+    if inner_payload is None and isinstance(payment, dict):
+        inner_payload = payment  # V1形式(signature/authorizationが直接トップレベル)にも対応
     pay2 = {
         "x402Version": 2,
-        "scheme": payment.get("scheme", "exact"),
-        "network": reqs2["network"],
-        "payload": payment.get("payload"),
         "accepted": reqs2,
+        "payload": inner_payload,
     }
-    if reqs2.get("resource"):
-        pay2["resource"] = {
-            "url": reqs2["resource"],
-            "description": reqs2.get("description", ""),
-            "mimeType": reqs2.get("mimeType", "application/json"),
-        }
+    resource = _resource_info(requirements)
+    if resource:
+        pay2["resource"] = resource
     return {"x402Version": 2, "paymentPayload": pay2, "paymentRequirements": reqs2}
 
 
@@ -114,7 +133,13 @@ def payment_requirements(resource_url: str, description: str, output_schema=None
 
 
 def body_402(requirements: dict, error="X-PAYMENT header is required", free=None) -> dict:
+    """x402 V2 PaymentRequired。resourceは公式TS型定義でこの応答オブジェクトの
+    トップレベルフィールド(ResourceInfo)であり、各accepts[]の中には無い
+    (旧実装はresourceをaccepts[]内に混入させており、実際の型定義と不一致だった)。"""
     body = {"x402Version": 2, "error": error, "accepts": [v2_requirements(requirements)]}
+    resource = _resource_info(requirements)
+    if resource:
+        body["resource"] = resource
     if free:
         body["free_alternatives"] = free   # 購入前に無料で価値を確認できる導線(要件3)
     return body

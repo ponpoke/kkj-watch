@@ -40,7 +40,11 @@ def main():
 
     status, _, body = http_get(url)
     assert status == 402, f"expected 402, got {status}: {body[:200]}"
-    req = json.loads(body)["accepts"][0]
+    body_json = json.loads(body)
+    req = body_json["accepts"][0]
+    resource = body_json.get("resource") or {}
+    req = {**req, "resource": resource.get("url"), "description": resource.get("description"),
+           "mimeType": resource.get("mimeType")}
     print(f"[1] 402 requirements: {json.dumps(req, ensure_ascii=False)}")
 
     now = int(time.time())
@@ -70,7 +74,7 @@ def main():
             acct = await cdp.evm.get_or_create_account(name="kkj-test-payer")
             message = {
                 "from": acct.address, "to": req["payTo"],
-                "value": req["maxAmountRequired"],
+                "value": req["amount"],
                 "validAfter": str(valid_after), "validBefore": str(valid_before),
                 "nonce": nonce,
             }
@@ -93,7 +97,7 @@ def main():
     payer, signature = asyncio.run(sign())
     print(f"[2] payer: {payer}")
     auth = {
-        "from": payer, "to": req["payTo"], "value": req["maxAmountRequired"],
+        "from": payer, "to": req["payTo"], "value": req["amount"],
         "validAfter": str(valid_after), "validBefore": str(valid_before), "nonce": nonce,
     }
     payment = {"scheme": "exact", "network": req["network"],
