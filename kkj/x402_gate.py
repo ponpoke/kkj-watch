@@ -192,4 +192,10 @@ def verify_and_settle(x_payment_b64: str, requirements: dict):
             return False, f"settle failed: {s.get('errorReason', s.get('error', 'unknown'))}"
         return True, base64.b64encode(json.dumps(s).encode()).decode()
     except Exception as e:
+        # スキーマ不一致の原因切り分け用: クライアントが送ってきたpaymentPayloadの
+        # 形(トップレベルのキーのみ、signature/authorizationの値は伏せる)を残す
+        shape = {k: ("..." if k in ("payload",) else v) for k, v in payment.items()} \
+            if isinstance(payment, dict) else str(type(payment))
+        print(f"[x402_diag] verify_and_settle failed: {e} | payment_keys={shape} "
+              f"| payload_keys={list(payment.get('payload', {}).keys()) if isinstance(payment, dict) and isinstance(payment.get('payload'), dict) else None}")
         return False, f"facilitator error: {e}"
