@@ -184,8 +184,9 @@ def _facilitator_post(endpoint: str, payload: dict) -> dict:
         with urllib.request.urlopen(req, timeout=90) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        # 4xx/5xxの本文(スキーマエラー詳細)を握りつぶさない
-        detail = e.read().decode("utf-8", "replace")[:500]
+        # 4xx/5xxの本文(スキーマエラー詳細)を握りつぶさない。500文字だと
+        # errorMessageの途中で切れて原因特定できないことがあった(実測)ため拡大。
+        detail = e.read().decode("utf-8", "replace")[:3000]
         raise RuntimeError(f"facilitator {endpoint} {e.code}: {detail}") from None
 
 
@@ -222,5 +223,6 @@ def verify_and_settle(x_payment_b64: str, requirements: dict):
         shape = {k: ("..." if k in ("payload",) else v) for k, v in payment.items()} \
             if isinstance(payment, dict) else str(type(payment))
         print(f"[x402_diag] verify_and_settle failed: {e} | payment_keys={shape} "
-              f"| payload_keys={list(payment.get('payload', {}).keys()) if isinstance(payment, dict) and isinstance(payment.get('payload'), dict) else None}")
+              f"| payload_keys={list(payment.get('payload', {}).keys()) if isinstance(payment, dict) and isinstance(payment.get('payload'), dict) else None}",
+              flush=True)
         return False, f"facilitator error: {e}"
